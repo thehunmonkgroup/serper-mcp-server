@@ -34,38 +34,14 @@ To install Serper MCP Server for Claude Desktop automatically via [Smithery](htt
 npx -y @smithery/cli install @garylab/serper-mcp-server --client claude
 ```
 
-### Using `uv` (recommended)
+### Using `pip`
 
-1. Make sure you had installed [`uv`](https://docs.astral.sh/uv/) on your os system.
-
-2. In your MCP client code configuration or **Claude** settings (file `claude_desktop_config.json`) add `serper` mcp server:
-    ```json
-    {
-        "mcpServers": {
-            "serper": {
-                "command": "uvx",
-                "args": ["serper-mcp-server"],
-                "env": {
-                    "SERPER_API_KEY": "<Your Serper API key>"
-                }
-            }
-        }
-    }
-    ```
-    `uv` will download mcp server automatically using `uvx` from [pypi.org](https://pypi.org/project/serper-mcp-server/) and apply to your MCP client.
-
-### Using `pip` for project
-1. Add `serper-mcp-server` to your MCP client code `requirements.txt` file.
-    ```txt
-    serper-mcp-server
+1. Install the package.
+    ```bash
+    python3 -m pip install serper-mcp-server
     ```
 
-2. Install the dependencies.
-    ```shell
-    pip install -r requirements.txt
-    ```
-
-3. Add the configuration for you client:
+2. In your MCP client code configuration or **Claude** settings (file `claude_desktop_config.json`), add the `serper` MCP server:
     ```json
     {
         "mcpServers": {
@@ -81,22 +57,22 @@ npx -y @smithery/cli install @garylab/serper-mcp-server --client claude
     ```
 
 
-### Using `pip` for globally usage
+### Developing locally
 
-1. Make sure the `pip` or `pip3` is in your os system.
+1. Clone the repository and install it in editable mode.
     ```bash
-    pip install serper-mcp-server
-    # or
-    pip3 install serper-mcp-server
+    git clone https://github.com/garylab/serper-mcp-server.git
+    cd serper-mcp-server
+    python3 -m pip install -e ".[dev]"
     ```
 
-2. MCP client code configuration or **Claude** settings, add `serper` mcp server:
+2. Configure your MCP client to run the local package:
     ```json
     {
         "mcpServers": {
             "serper": {
                 "command": "python3",
-                "args": ["serper-mcp-server"],
+                "args": ["-m", "serper_mcp_server"],
                 "env": {
                     "SERPER_API_KEY": "<Your Serper API key>"
                 }
@@ -108,18 +84,10 @@ npx -y @smithery/cli install @garylab/serper-mcp-server --client claude
 
 ## Debugging
 
-You can use the MCP inspector to debug the server. For `uvx` installations:
+You can use the MCP inspector to debug the server after installing it with `pip`:
 
 ```bash
-npx @modelcontextprotocol/inspector uvx serper-mcp-server
-```
-
-Or if you've installed the package in a specific directory or are developing on it:
-
-```bash
-git clone https://github.com/garylab/serper-mcp-server.git
-cd serper-mcp-server
-npx @modelcontextprotocol/inspector uv run serper-mcp-server -e SERPER_API_KEY=<the key>
+SERPER_API_KEY=<the key> npx @modelcontextprotocol/inspector python3 -m serper_mcp_server
 ```
 
 
