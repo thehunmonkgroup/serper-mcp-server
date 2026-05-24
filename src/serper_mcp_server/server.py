@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel
 
 from .core import SerperClient
 from .enums import SerperTools
@@ -30,6 +32,8 @@ SERVER_INSTRUCTIONS = (
     "content."
 )
 
+FORCE_ENV_PREFIX = "SERPER_FORCE_"
+
 READ_ONLY_OPEN_WEB_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -38,6 +42,7 @@ READ_ONLY_OPEN_WEB_ANNOTATIONS = ToolAnnotations(
 )
 
 logger = logging.getLogger(__name__)
+RequestModelT = TypeVar("RequestModelT", bound=BaseModel)
 
 
 class SerperMcpApplication:
@@ -103,6 +108,89 @@ class SerperMcpApplication:
         logger.debug("Executing Serper tool %s", tool.value)
         return await self.client.google(tool, request)
 
+    def build_request(
+        self,
+        model_type: type[RequestModelT],
+        **values: Any,
+    ) -> RequestModelT:
+        """Build a request model after applying forced environment overrides.
+
+        :param model_type: Pydantic request model type to instantiate.
+        :type model_type: type[RequestModelT]
+        :param values: Request field values from the MCP tool call.
+        :type values: Any
+        :return: Validated request model.
+        :rtype: RequestModelT
+        """
+
+        forced_values = {
+            name: self.resolve_forced_parameter(name, value)
+            for name, value in values.items()
+        }
+        return model_type(**forced_values)
+
+    def resolve_forced_parameter(self, parameter_name: str, value: Any) -> Any:
+        """Resolve a parameter value from a forced env var or the tool argument.
+
+        :param parameter_name: Tool parameter name.
+        :type parameter_name: str
+        :param value: Value supplied by the MCP tool caller.
+        :type value: Any
+        :return: Forced environment value when present, otherwise the caller value.
+        :rtype: Any
+        """
+
+        env_var_name = self.force_env_var_name(parameter_name)
+        if env_var_name in os.environ:
+            logger.debug("Using forced Serper parameter from %s", env_var_name)
+            return os.environ[env_var_name]
+        return value
+
+    @staticmethod
+    def force_env_var_name(parameter_name: str) -> str:
+        """Return the forced environment variable name for a parameter.
+
+        :param parameter_name: Tool parameter name.
+        :type parameter_name: str
+        :return: Environment variable name with the ``SERPER_FORCE_`` prefix.
+        :rtype: str
+        """
+
+        return f"{FORCE_ENV_PREFIX}{SerperMcpApplication.to_env_name(parameter_name)}"
+
+    @staticmethod
+    def to_env_name(parameter_name: str) -> str:
+        """Convert a Python or Serper parameter name into env-var format.
+
+        :param parameter_name: Parameter name such as ``includeMarkdown``.
+        :type parameter_name: str
+        :return: Upper snake-case parameter name.
+        :rtype: str
+        """
+
+        env_name_parts: list[str] = []
+        for index, character in enumerate(parameter_name):
+            previous_character = parameter_name[index - 1] if index > 0 else ""
+            next_character = (
+                parameter_name[index + 1] if index + 1 < len(parameter_name) else ""
+            )
+            should_add_separator = (
+                index > 0
+                and character.isupper()
+                and (
+                    previous_character.islower()
+                    or previous_character.isdigit()
+                    or (previous_character.isupper() and next_character.islower())
+                )
+            )
+            if should_add_separator:
+                env_name_parts.append("_")
+            if character in {"-", " "}:
+                env_name_parts.append("_")
+            else:
+                env_name_parts.append(character.upper())
+        return "".join(env_name_parts)
+
     def _register_search_tools(self) -> None:
         """Register general search-family tools.
 
@@ -121,7 +209,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google web results through Serper."""
 
-            request = SearchRequest(
+            request = self.build_request(
+                SearchRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -143,7 +232,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google image results through Serper."""
 
-            request = SearchRequest(
+            request = self.build_request(
+                SearchRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -167,7 +257,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google video results through Serper."""
 
-            request = SearchRequest(
+            request = self.build_request(
+                SearchRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -191,7 +282,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google news results through Serper."""
 
-            request = SearchRequest(
+            request = self.build_request(
+                SearchRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -254,7 +346,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google places results through Serper."""
 
-            request = AutocorrectRequest(
+            request = self.build_request(
+                AutocorrectRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -276,7 +369,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google Scholar results through Serper."""
 
-            request = AutocorrectRequest(
+            request = self.build_request(
+                AutocorrectRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -298,7 +392,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Fetch Google autocomplete suggestions through Serper."""
 
-            request = AutocorrectRequest(
+            request = self.build_request(
+                AutocorrectRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -353,7 +448,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google Maps results through Serper."""
 
-            request = MapsRequest(
+            request = self.build_request(
+                MapsRequest,
                 q=q,
                 ll=ll,
                 placeId=placeId,
@@ -394,7 +490,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google review results through Serper."""
 
-            request = ReviewsRequest(
+            request = self.build_request(
+                ReviewsRequest,
                 fid=fid,
                 cid=cid,
                 placeId=placeId,
@@ -433,7 +530,8 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google shopping results through Serper."""
 
-            request = ShoppingRequest(
+            request = self.build_request(
+                ShoppingRequest,
                 q=q,
                 gl=gl,
                 location=location,
@@ -467,7 +565,7 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google Lens results through Serper."""
 
-            request = LensRequest(url=url, gl=gl, hl=hl)
+            request = self.build_request(LensRequest, url=url, gl=gl, hl=hl)
             return await self.client.google(SerperTools.GOOGLE_SEARCH_LENS, request)
 
         self.mcp.add_tool(
@@ -493,7 +591,7 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Search Google patents results through Serper."""
 
-            request = PatentsRequest(q=q, num=num, page=page)
+            request = self.build_request(PatentsRequest, q=q, num=num, page=page)
             return await self.client.google(SerperTools.GOOGLE_SEARCH_PATENTS, request)
 
         self.mcp.add_tool(
@@ -518,7 +616,11 @@ class SerperMcpApplication:
         ) -> dict[str, Any]:
             """Scrape a webpage through Serper."""
 
-            request = WebpageRequest(url=url, includeMarkdown=includeMarkdown)
+            request = self.build_request(
+                WebpageRequest,
+                url=url,
+                includeMarkdown=includeMarkdown,
+            )
             return await self.client.scrape(request)
 
         self.mcp.add_tool(

@@ -6,12 +6,13 @@ import asyncio
 from typing import Any, cast
 
 from mcp import types
+import pytest
 from typing_extensions import override
 
 from serper_mcp_server.core import SerperClient, SerperConfigurationError
 from serper_mcp_server.enums import SerperTools
 from serper_mcp_server.schemas import WebpageRequest
-from serper_mcp_server.server import create_mcp_server
+from serper_mcp_server.server import SerperMcpApplication, create_mcp_server
 
 
 class FakeSerperClient(SerperClient):
@@ -147,6 +148,45 @@ def test_google_search_returns_structured_content() -> None:
     assert client.last_payload["num"] == 5
 
 
+def test_forced_env_var_name_converts_parameter_names() -> None:
+    """Forced env var names are derived consistently from tool parameter names."""
+
+    assert SerperMcpApplication.force_env_var_name("gl") == "SERPER_FORCE_GL"
+    assert SerperMcpApplication.force_env_var_name("includeMarkdown") == (
+        "SERPER_FORCE_INCLUDE_MARKDOWN"
+    )
+    assert SerperMcpApplication.force_env_var_name("nextPageToken") == (
+        "SERPER_FORCE_NEXT_PAGE_TOKEN"
+    )
+    assert SerperMcpApplication.force_env_var_name("placeId") == (
+        "SERPER_FORCE_PLACE_ID"
+    )
+
+
+def test_google_search_uses_forced_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search calls prefer forced environment values over caller arguments."""
+
+    monkeypatch.setenv("SERPER_FORCE_GL", "us")
+    monkeypatch.setenv("SERPER_FORCE_HL", "en")
+    monkeypatch.setenv("SERPER_FORCE_NUM", "7")
+    client = FakeSerperClient()
+    mcp_server = create_mcp_server(client)
+
+    run_async(
+        mcp_server.call_tool(
+            SerperTools.GOOGLE_SEARCH.value,
+            {"q": "openai", "gl": "ca", "hl": "fr", "num": 5},
+        )
+    )
+
+    assert client.last_payload is not None
+    assert client.last_payload["gl"] == "us"
+    assert client.last_payload["hl"] == "en"
+    assert client.last_payload["num"] == 7
+
+
 def test_webpage_scrape_returns_structured_content() -> None:
     """Successful scrape calls return structured content."""
 
@@ -163,6 +203,26 @@ def test_webpage_scrape_returns_structured_content() -> None:
     assert structured_content["credits"] == 2
     assert structured_content["metadata"]["title"] == "Example Domain"
     assert content[0].type == "text"
+    assert client.last_payload is not None
+    assert client.last_payload["includeMarkdown"] is True
+
+
+def test_webpage_scrape_uses_forced_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scrape calls prefer forced environment values over caller arguments."""
+
+    monkeypatch.setenv("SERPER_FORCE_INCLUDE_MARKDOWN", "true")
+    client = FakeSerperClient()
+    mcp_server = create_mcp_server(client)
+
+    run_async(
+        mcp_server.call_tool(
+            SerperTools.WEBPAGE_SCRAPE.value,
+            {"url": "https://example.com", "includeMarkdown": False},
+        )
+    )
+
     assert client.last_payload is not None
     assert client.last_payload["includeMarkdown"] is True
 

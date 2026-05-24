@@ -23,6 +23,22 @@ A Model Context Protocol server that provides **Google Search via Serper**. This
 - `google_search_autocomplete` - Set [all the parameters](src/serper_mcp_server/schemas.py#L20)
 - `webpage_scrape` - Set [all the parameters](src/serper_mcp_server/schemas.py#L62)
 
+## Configuration
+
+Set `SERPER_API_KEY` to your Serper API key.
+
+Any tool parameter can be forced with a `SERPER_FORCE_` environment variable. Forced values take precedence over values passed by the MCP client. Parameter names are converted to upper snake case, so `includeMarkdown` becomes `SERPER_FORCE_INCLUDE_MARKDOWN`, `nextPageToken` becomes `SERPER_FORCE_NEXT_PAGE_TOKEN`, and `gl` becomes `SERPER_FORCE_GL`.
+
+For example:
+
+```json
+{
+    "SERPER_API_KEY": "<Your Serper API key>",
+    "SERPER_FORCE_GL": "us",
+    "SERPER_FORCE_HL": "en",
+    "SERPER_FORCE_INCLUDE_MARKDOWN": "true"
+}
+```
 
 ## Usage
 
