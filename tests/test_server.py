@@ -11,6 +11,12 @@ from typing_extensions import override
 
 from serper_mcp_server.core import SerperClient, SerperConfigurationError
 from serper_mcp_server.enums import SerperTools
+from serper_mcp_server.metrics import (
+    METRICS_ENABLED_ENV_VAR,
+    METRICS_HOST_ENV_VAR,
+    METRICS_PORT_ENV_VAR,
+    NullMetricsRecorder,
+)
 from serper_mcp_server.schemas import WebpageRequest
 from serper_mcp_server.server import SerperMcpApplication, create_mcp_server
 
@@ -87,6 +93,38 @@ class FailingSerperClient(SerperClient):
         """
 
         raise SerperConfigurationError("SERPER_API_KEY is empty")
+
+
+class FakeMetricsService:
+    """Metrics service test double."""
+
+    def __init__(self) -> None:
+        self.started_host: str | None = None
+        self.started_port: int | None = None
+        self.closed: bool = False
+
+    async def start_http_server(self, host: str, port: int) -> None:
+        """Record sidecar startup arguments.
+
+        :param host: Host to bind.
+        :type host: str
+        :param port: Port to bind.
+        :type port: int
+        :return: None.
+        :rtype: None
+        """
+
+        self.started_host = host
+        self.started_port = port
+
+    async def close(self) -> None:
+        """Record service closure.
+
+        :return: None.
+        :rtype: None
+        """
+
+        self.closed = True
 
 
 def run_async(awaitable: Any) -> Any:
@@ -225,6 +263,46 @@ def test_webpage_scrape_uses_forced_environment_values(
 
     assert client.last_payload is not None
     assert client.last_payload["includeMarkdown"] is True
+
+
+def test_metrics_disabled_uses_null_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled metrics leave the client with a null metrics recorder."""
+
+    monkeypatch.setenv(METRICS_ENABLED_ENV_VAR, "false")
+    application = SerperMcpApplication(FakeSerperClient())
+
+    run_async(application.start_metrics())
+
+    assert isinstance(application.client.metrics, NullMetricsRecorder)
+    assert application.metrics_service is None
+
+
+def test_metrics_service_starts_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Application startup owns the metrics service lifecycle."""
+
+    monkeypatch.setenv(METRICS_ENABLED_ENV_VAR, "true")
+    monkeypatch.setenv(METRICS_HOST_ENV_VAR, "127.0.0.2")
+    monkeypatch.setenv(METRICS_PORT_ENV_VAR, "3006")
+    monkeypatch.setattr("serper_mcp_server.server.MetricsService", FakeMetricsService)
+    application = SerperMcpApplication(FakeSerperClient())
+
+    run_async(application.start_metrics())
+
+    service = application.metrics_service
+    assert isinstance(service, FakeMetricsService)
+    assert service.started_host == "127.0.0.2"
+    assert service.started_port == 3006
+    assert application.client.metrics is service
+
+    run_async(application.close_metrics())
+
+    assert service.closed is True
+    assert application.metrics_service is None
+    assert isinstance(application.client.metrics, NullMetricsRecorder)
 
 
 def test_expected_tool_failure_sets_is_error() -> None:
