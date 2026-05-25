@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterator
+from asyncio import Lock
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Literal, TypeVar
+from weakref import WeakKeyDictionary
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
-from .core import SerperClient
+from .core import SerperClient, SerperConfigurationError
 from .enums import SerperTools
 from .metrics import (
     MetricsConfigurationError,
@@ -41,6 +43,8 @@ SERVER_INSTRUCTIONS = (
 )
 
 FORCE_ENV_PREFIX = "SERPER_FORCE_"
+SESSION_LIMIT_ENV_PREFIX = "SERPER_"
+SESSION_LIMIT_ENV_SUFFIX = "_SESSION_LIMIT"
 
 READ_ONLY_OPEN_WEB_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
@@ -53,6 +57,22 @@ logger = logging.getLogger(__name__)
 RequestModelT = TypeVar("RequestModelT", bound=BaseModel)
 
 
+class SessionLimitFallbackKey:
+    """Weak-referenceable fallback key for direct in-process tool calls."""
+
+
+class UsageLimitReachedError(Exception):
+    """Error raised when a tool reaches its configured session usage limit."""
+
+
+class ToolUsageState:
+    """Mutable usage state for one tool in one MCP client session."""
+
+    def __init__(self) -> None:
+        self.successful_calls: int = 0
+        self.lock: Lock = Lock()
+
+
 class SerperMcpApplication:
     """Factory and registry for the Serper FastMCP server.
 
@@ -63,6 +83,14 @@ class SerperMcpApplication:
     def __init__(self, client: SerperClient | None = None) -> None:
         self.client: SerperClient = client or SerperClient()
         self.metrics_service: MetricsService | None = None
+        self.session_limits: dict[SerperTools, int] = self.load_session_limits()
+        self.session_usage: WeakKeyDictionary[
+            object,
+            dict[SerperTools, ToolUsageState],
+        ] = WeakKeyDictionary()
+        self.direct_call_session_key: SessionLimitFallbackKey = (
+            SessionLimitFallbackKey()
+        )
         self.mcp: FastMCP = FastMCP(
             "Serper",
             instructions=SERVER_INSTRUCTIONS,
@@ -152,11 +180,144 @@ class SerperMcpApplication:
         self._register_patents_tool()
         self._register_scrape_tool()
 
+    def load_session_limits(self) -> dict[SerperTools, int]:
+        """Load configured per-session tool limits from the environment.
+
+        :return: Tool limits keyed by tool name.
+        :rtype: dict[SerperTools, int]
+        :raises SerperConfigurationError: If a limit is invalid.
+        """
+
+        limits: dict[SerperTools, int] = {}
+        for tool_name in SerperTools:
+            env_var_name = self.session_limit_env_var_name(tool_name)
+            if env_var_name not in os.environ:
+                continue
+            raw_limit = os.environ[env_var_name]
+            try:
+                limit = int(raw_limit)
+            except ValueError as exc:
+                message = f"{env_var_name} must be a positive integer"
+                raise SerperConfigurationError(message) from exc
+            if limit <= 0:
+                message = f"{env_var_name} must be a positive integer"
+                raise SerperConfigurationError(message)
+            limits[tool_name] = limit
+        return limits
+
+    @staticmethod
+    def session_limit_env_var_name(tool_name: SerperTools) -> str:
+        """Return the session limit environment variable name for a tool.
+
+        :param tool_name: Tool whose environment variable name should be built.
+        :type tool_name: SerperTools
+        :return: Session limit environment variable name.
+        :rtype: str
+        """
+
+        return (
+            f"{SESSION_LIMIT_ENV_PREFIX}"
+            f"{SerperMcpApplication.to_env_name(tool_name.value)}"
+            f"{SESSION_LIMIT_ENV_SUFFIX}"
+        )
+
+    def get_session_key(self, ctx: Context[Any, Any, Any]) -> object:
+        """Return the key used for per-session tool usage state.
+
+        :param ctx: FastMCP request context.
+        :type ctx: Context[Any, Any, Any]
+        :return: MCP session object or direct-call fallback key.
+        :rtype: object
+        """
+
+        try:
+            return ctx.session
+        except ValueError:
+            return self.direct_call_session_key
+
+    def get_usage_state(
+        self,
+        ctx: Context[Any, Any, Any],
+        tool_name: SerperTools,
+    ) -> ToolUsageState:
+        """Return mutable usage state for a tool in the current session.
+
+        :param ctx: FastMCP request context.
+        :type ctx: Context[Any, Any, Any]
+        :param tool_name: Tool whose usage is being tracked.
+        :type tool_name: SerperTools
+        :return: Tool usage state.
+        :rtype: ToolUsageState
+        """
+
+        session_key = self.get_session_key(ctx)
+        usage_by_tool = self.session_usage.setdefault(session_key, {})
+        if tool_name not in usage_by_tool:
+            usage_by_tool[tool_name] = ToolUsageState()
+        return usage_by_tool[tool_name]
+
+    async def call_with_session_limit(
+        self,
+        ctx: Context[Any, Any, Any],
+        tool_name: SerperTools,
+        call: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Call a tool implementation while enforcing successful-call limits.
+
+        :param ctx: FastMCP request context.
+        :type ctx: Context[Any, Any, Any]
+        :param tool_name: Tool being called.
+        :type tool_name: SerperTools
+        :param call: Awaitable Serper client call.
+        :type call: Callable[[], Awaitable[dict[str, Any]]]
+        :return: Serper client response.
+        :rtype: dict[str, Any]
+        :raises UsageLimitReachedError: If the session limit is exhausted.
+        """
+
+        limit = self.session_limits.get(tool_name)
+        if limit is None:
+            return await call()
+
+        usage_state = self.get_usage_state(ctx, tool_name)
+        async with usage_state.lock:
+            if usage_state.successful_calls >= limit:
+                raise UsageLimitReachedError(
+                    self.build_usage_limit_message(tool_name, limit)
+                )
+            response = await call()
+            usage_state.successful_calls += 1
+            return response
+
+    @staticmethod
+    def build_usage_limit_message(tool_name: SerperTools, limit: int) -> str:
+        """Build a model-directed usage limit error message.
+
+        :param tool_name: Tool whose limit has been reached.
+        :type tool_name: SerperTools
+        :param limit: Configured successful-call limit.
+        :type limit: int
+        :return: Usage limit error message.
+        :rtype: str
+        """
+
+        return (
+            f"usage limit reached: {tool_name.value} has reached its session "
+            f"limit of {limit} successful calls. Do not call {tool_name.value} "
+            "again in this MCP client session; further calls will fail until "
+            "a new session is started."
+        )
+
     async def execute_google_tool(
-        self, tool: SerperTools, request: BaseModel
+        self,
+        ctx: Context[Any, Any, Any],
+        tool: SerperTools,
+        request: BaseModel,
     ) -> dict[str, Any]:
         """Execute a Google-backed Serper tool.
 
+        :param ctx: FastMCP request context.
+        :type ctx: Context[Any, Any, Any]
         :param tool: Serper tool enum value.
         :type tool: SerperTools
         :param request: Validated search request.
@@ -166,7 +327,11 @@ class SerperMcpApplication:
         """
 
         logger.debug("Executing Serper tool %s", tool.value)
-        return await self.client.google(tool, request)
+        return await self.call_with_session_limit(
+            ctx,
+            tool,
+            lambda: self.client.google(tool, request),
+        )
 
     def build_request(
         self,
@@ -260,6 +425,7 @@ class SerperMcpApplication:
 
         async def google_search(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -279,10 +445,15 @@ class SerperMcpApplication:
                 tbs=tbs,
                 num=num,
             )
-            return await self.execute_google_tool(SerperTools.GOOGLE_SEARCH, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH,
+                request,
+            )
 
         async def google_search_images(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -303,11 +474,14 @@ class SerperMcpApplication:
                 num=num,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_IMAGES, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_IMAGES,
+                request,
             )
 
         async def google_search_videos(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -328,11 +502,14 @@ class SerperMcpApplication:
                 num=num,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_VIDEOS, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_VIDEOS,
+                request,
             )
 
         async def google_search_news(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -353,7 +530,9 @@ class SerperMcpApplication:
                 num=num,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_NEWS, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_NEWS,
+                request,
             )
 
         self.mcp.add_tool(
@@ -398,6 +577,7 @@ class SerperMcpApplication:
 
         async def google_search_places(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -416,11 +596,14 @@ class SerperMcpApplication:
                 autocorrect=autocorrect,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_PLACES, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_PLACES,
+                request,
             )
 
         async def google_search_scholar(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -439,11 +622,14 @@ class SerperMcpApplication:
                 autocorrect=autocorrect,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_SCHOLAR, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_SCHOLAR,
+                request,
             )
 
         async def google_search_autocomplete(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -462,7 +648,9 @@ class SerperMcpApplication:
                 autocorrect=autocorrect,
             )
             return await self.execute_google_tool(
-                SerperTools.GOOGLE_SEARCH_AUTOCOMPLETE, request
+                ctx,
+                SerperTools.GOOGLE_SEARCH_AUTOCOMPLETE,
+                request,
             )
 
         self.mcp.add_tool(
@@ -499,6 +687,7 @@ class SerperMcpApplication:
 
         async def google_search_maps(
             q: str,
+            ctx: Context[Any, Any, Any],
             ll: str | None = None,
             placeId: str | None = None,
             cid: str | None = None,
@@ -518,7 +707,11 @@ class SerperMcpApplication:
                 hl=hl,
                 page=page,
             )
-            return await self.client.google(SerperTools.GOOGLE_SEARCH_MAPS, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH_MAPS,
+                request,
+            )
 
         self.mcp.add_tool(
             google_search_maps,
@@ -538,6 +731,7 @@ class SerperMcpApplication:
 
         async def google_search_reviews(
             fid: str,
+            ctx: Context[Any, Any, Any],
             cid: str | None = None,
             placeId: str | None = None,
             sortBy: Literal[
@@ -561,7 +755,11 @@ class SerperMcpApplication:
                 gl=gl,
                 hl=hl,
             )
-            return await self.client.google(SerperTools.GOOGLE_SEARCH_REVIEWS, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH_REVIEWS,
+                request,
+            )
 
         self.mcp.add_tool(
             google_search_reviews,
@@ -581,6 +779,7 @@ class SerperMcpApplication:
 
         async def google_search_shopping(
             q: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             location: str | None = None,
             hl: str | None = None,
@@ -600,7 +799,11 @@ class SerperMcpApplication:
                 autocorrect=autocorrect,
                 num=num,
             )
-            return await self.client.google(SerperTools.GOOGLE_SEARCH_SHOPPING, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH_SHOPPING,
+                request,
+            )
 
         self.mcp.add_tool(
             google_search_shopping,
@@ -620,13 +823,18 @@ class SerperMcpApplication:
 
         async def google_search_lens(
             url: str,
+            ctx: Context[Any, Any, Any],
             gl: str | None = None,
             hl: str | None = None,
         ) -> dict[str, Any]:
             """Search Google Lens results through Serper."""
 
             request = self.build_request(LensRequest, url=url, gl=gl, hl=hl)
-            return await self.client.google(SerperTools.GOOGLE_SEARCH_LENS, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH_LENS,
+                request,
+            )
 
         self.mcp.add_tool(
             google_search_lens,
@@ -646,13 +854,18 @@ class SerperMcpApplication:
 
         async def google_search_patents(
             q: str,
+            ctx: Context[Any, Any, Any],
             num: int = 10,
             page: int = 1,
         ) -> dict[str, Any]:
             """Search Google patents results through Serper."""
 
             request = self.build_request(PatentsRequest, q=q, num=num, page=page)
-            return await self.client.google(SerperTools.GOOGLE_SEARCH_PATENTS, request)
+            return await self.execute_google_tool(
+                ctx,
+                SerperTools.GOOGLE_SEARCH_PATENTS,
+                request,
+            )
 
         self.mcp.add_tool(
             google_search_patents,
@@ -672,6 +885,7 @@ class SerperMcpApplication:
 
         async def webpage_scrape(
             url: str,
+            ctx: Context[Any, Any, Any],
             includeMarkdown: bool = False,
         ) -> dict[str, Any]:
             """Scrape a webpage through Serper."""
@@ -681,7 +895,11 @@ class SerperMcpApplication:
                 url=url,
                 includeMarkdown=includeMarkdown,
             )
-            return await self.client.scrape(request)
+            return await self.call_with_session_limit(
+                ctx,
+                SerperTools.WEBPAGE_SCRAPE,
+                lambda: self.client.scrape(request),
+            )
 
         self.mcp.add_tool(
             webpage_scrape,

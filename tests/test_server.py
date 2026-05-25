@@ -9,7 +9,11 @@ from mcp import types
 import pytest
 from typing_extensions import override
 
-from serper_mcp_server.core import SerperClient, SerperConfigurationError
+from serper_mcp_server.core import (
+    SerperClient,
+    SerperClientError,
+    SerperConfigurationError,
+)
 from serper_mcp_server.enums import SerperTools
 from serper_mcp_server.metrics import (
     METRICS_ENABLED_ENV_VAR,
@@ -95,6 +99,36 @@ class FailingSerperClient(SerperClient):
         raise SerperConfigurationError("SERPER_API_KEY is empty")
 
 
+class IntermittentFailingSerperClient(FakeSerperClient):
+    """Serper client test double that fails once before succeeding."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.should_fail_search: bool = True
+
+    @override
+    async def google(
+        self,
+        tool: SerperTools,
+        request: Any,
+    ) -> dict[str, Any]:
+        """Fail once, then return a fake Google response.
+
+        :param tool: Serper tool enum value.
+        :type tool: SerperTools
+        :param request: Validated request model.
+        :type request: Any
+        :return: Fake Serper response.
+        :rtype: dict[str, Any]
+        :raises SerperClientError: On the first search call.
+        """
+
+        if self.should_fail_search:
+            self.should_fail_search = False
+            raise SerperClientError("Serper API returned HTTP 500")
+        return await super().google(tool, request)
+
+
 class FakeMetricsService:
     """Metrics service test double."""
 
@@ -127,6 +161,21 @@ class FakeMetricsService:
         self.closed = True
 
 
+@pytest.fixture(autouse=True)
+def clear_session_limit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear session limit configuration unless a test sets it explicitly.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :type monkeypatch: pytest.MonkeyPatch
+    :return: None.
+    :rtype: None
+    """
+
+    for tool_name in SerperTools:
+        env_var_name = SerperMcpApplication.session_limit_env_var_name(tool_name)
+        monkeypatch.delenv(env_var_name, raising=False)
+
+
 def run_async(awaitable: Any) -> Any:
     """Run an awaitable for tests.
 
@@ -137,6 +186,52 @@ def run_async(awaitable: Any) -> Any:
     """
 
     return asyncio.run(awaitable)
+
+
+def call_tool_result(
+    mcp_server: Any,
+    tool_name: SerperTools,
+    arguments: dict[str, Any],
+) -> types.CallToolResult:
+    """Call a tool through the low-level MCP request handler.
+
+    :param mcp_server: FastMCP server instance.
+    :type mcp_server: Any
+    :param tool_name: Tool to call.
+    :type tool_name: SerperTools
+    :param arguments: Tool arguments.
+    :type arguments: dict[str, Any]
+    :return: MCP call tool result.
+    :rtype: types.CallToolResult
+    """
+
+    low_level_server = getattr(mcp_server, "_mcp_server")
+    handler = low_level_server.request_handlers[types.CallToolRequest]
+    result = run_async(
+        handler(
+            types.CallToolRequest(
+                params=types.CallToolRequestParams(
+                    name=tool_name.value,
+                    arguments=arguments,
+                )
+            )
+        )
+    )
+    return result.root
+
+
+def call_tool_text(call_result: types.CallToolResult) -> str:
+    """Return the first text content item from a tool result.
+
+    :param call_result: MCP call tool result.
+    :type call_result: types.CallToolResult
+    :return: First text content string.
+    :rtype: str
+    """
+
+    content = call_result.content[0]
+    assert isinstance(content, types.TextContent)
+    return content.text
 
 
 def test_tool_list_contains_expected_metadata() -> None:
@@ -263,6 +358,188 @@ def test_webpage_scrape_uses_forced_environment_values(
 
     assert client.last_payload is not None
     assert client.last_payload["includeMarkdown"] is True
+
+
+def test_google_search_session_limit_errors_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search limits apply after the configured number of successful calls."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "1",
+    )
+    mcp_server = create_mcp_server(FakeSerperClient())
+
+    first_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    second_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+
+    assert first_result.isError is False
+    assert second_result.isError is True
+    second_result_text = call_tool_text(second_result)
+    assert "usage limit reached" in second_result_text
+    assert "Do not call google_search again" in second_result_text
+
+
+def test_webpage_scrape_session_limit_errors_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scrape limits apply after the configured number of successful calls."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.WEBPAGE_SCRAPE),
+        "1",
+    )
+    mcp_server = create_mcp_server(FakeSerperClient())
+
+    first_result = call_tool_result(
+        mcp_server,
+        SerperTools.WEBPAGE_SCRAPE,
+        {"url": "https://example.com"},
+    )
+    second_result = call_tool_result(
+        mcp_server,
+        SerperTools.WEBPAGE_SCRAPE,
+        {"url": "https://example.com"},
+    )
+
+    assert first_result.isError is False
+    assert second_result.isError is True
+    second_result_text = call_tool_text(second_result)
+    assert "usage limit reached" in second_result_text
+    assert "Do not call webpage_scrape again" in second_result_text
+
+
+def test_session_limits_are_independent_by_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausting one tool limit does not block another tool."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "1",
+    )
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(
+            SerperTools.GOOGLE_SEARCH_IMAGES
+        ),
+        "1",
+    )
+    mcp_server = create_mcp_server(FakeSerperClient())
+
+    search_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    limited_search_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    image_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH_IMAGES,
+        {"q": "openai"},
+    )
+
+    assert search_result.isError is False
+    assert limited_search_result.isError is True
+    assert image_result.isError is False
+
+
+def test_validation_failures_do_not_consume_session_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calls rejected by MCP validation do not count against the limit."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "1",
+    )
+    mcp_server = create_mcp_server(FakeSerperClient())
+
+    invalid_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai", "num": 0},
+    )
+    successful_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    limited_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+
+    assert invalid_result.isError is True
+    assert successful_result.isError is False
+    assert limited_result.isError is True
+    assert "usage limit reached" in call_tool_text(limited_result)
+
+
+def test_serper_failures_do_not_consume_session_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serper client failures do not count against the limit."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "1",
+    )
+    mcp_server = create_mcp_server(IntermittentFailingSerperClient())
+
+    failed_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    successful_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+    limited_result = call_tool_result(
+        mcp_server,
+        SerperTools.GOOGLE_SEARCH,
+        {"q": "openai"},
+    )
+
+    assert failed_result.isError is True
+    assert "Serper API returned HTTP 500" in call_tool_text(failed_result)
+    assert successful_result.isError is False
+    assert limited_result.isError is True
+    assert "usage limit reached" in call_tool_text(limited_result)
+
+
+@pytest.mark.parametrize("limit_value", ["invalid", "0", "-1"])
+def test_invalid_session_limit_fails_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_value: str,
+) -> None:
+    """Invalid configured session limits fail server creation clearly."""
+
+    env_var_name = SerperMcpApplication.session_limit_env_var_name(
+        SerperTools.GOOGLE_SEARCH_IMAGES
+    )
+    monkeypatch.setenv(env_var_name, limit_value)
+
+    with pytest.raises(
+        SerperConfigurationError,
+        match=f"{env_var_name} must be a positive integer",
+    ):
+        create_mcp_server(FakeSerperClient())
 
 
 def test_metrics_disabled_uses_null_recorder(
