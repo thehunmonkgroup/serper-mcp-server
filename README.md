@@ -9,19 +9,19 @@ A Model Context Protocol server that provides **Google Search via Serper**. This
 
 ## Available Tools
 
-- `google_search` - Set [all the parameters](src/serper_mcp_server/schemas.py#L15)
-- `google_search_images` - Set [all the parameters](src/serper_mcp_server/schemas.py#L15)
-- `google_search_videos` - Set [all the parameters](src/serper_mcp_server/schemas.py#L15)
-- `google_search_places` - Set [all the parameters](src/serper_mcp_server/schemas.py#L20)
-- `google_search_maps` - Set [all the parameters](src/serper_mcp_server/schemas.py#L24)
-- `google_search_reviews` - Set [all the parameters](src/serper_mcp_server/schemas.py#L34)
-- `google_search_news` - Set [all the parameters](src/serper_mcp_server/schemas.py#L15)
-- `google_search_shopping` - Set [all the parameters](src/serper_mcp_server/schemas.py#L45)
-- `google_search_lens` - Set [all the parameters](src/serper_mcp_server/schemas.py#L50)
-- `google_search_scholar` - Set [all the parameters](src/serper_mcp_server/schemas.py#L20)
-- `google_search_patents` - Set [all the parameters](src/serper_mcp_server/schemas.py#L56)
-- `google_search_autocomplete` - Set [all the parameters](src/serper_mcp_server/schemas.py#L20)
-- `webpage_scrape` - Set [all the parameters](src/serper_mcp_server/schemas.py#L62)
+- `google_search` - Search Google web results.
+- `google_search_images` - Search Google image results.
+- `google_search_videos` - Search Google video results.
+- `google_search_places` - Search Google places results.
+- `google_search_maps` - Search Google Maps results.
+- `google_search_reviews` - Search Google review results.
+- `google_search_news` - Search Google news results.
+- `google_search_shopping` - Search Google shopping results.
+- `google_search_lens` - Search Google Lens results from an image URL.
+- `google_search_scholar` - Search Google Scholar results.
+- `google_search_patents` - Search Google patents results.
+- `google_search_autocomplete` - Fetch Google autocomplete suggestions.
+- `webpage_scrape` - Scrape a webpage URL.
 
 ## Configuration
 

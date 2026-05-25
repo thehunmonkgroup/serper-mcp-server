@@ -240,24 +240,119 @@ def test_tool_list_contains_expected_metadata() -> None:
     mcp_server = create_mcp_server(FakeSerperClient())
     tools = run_async(mcp_server.list_tools())
     tools_by_name = {tool.name: tool for tool in tools}
+    expected_tool_descriptions = {
+        SerperTools.GOOGLE_SEARCH.value: "Search Google web results.",
+        SerperTools.GOOGLE_SEARCH_IMAGES.value: "Search Google image results.",
+        SerperTools.GOOGLE_SEARCH_VIDEOS.value: "Search Google video results.",
+        SerperTools.GOOGLE_SEARCH_PLACES.value: "Search Google places results.",
+        SerperTools.GOOGLE_SEARCH_MAPS.value: "Search Google Maps results.",
+        SerperTools.GOOGLE_SEARCH_REVIEWS.value: "Search Google review results.",
+        SerperTools.GOOGLE_SEARCH_NEWS.value: "Search Google news results.",
+        SerperTools.GOOGLE_SEARCH_SHOPPING.value: ("Search Google shopping results."),
+        SerperTools.GOOGLE_SEARCH_LENS.value: (
+            "Search Google Lens results from an image URL."
+        ),
+        SerperTools.GOOGLE_SEARCH_SCHOLAR.value: ("Search Google Scholar results."),
+        SerperTools.GOOGLE_SEARCH_PATENTS.value: "Search Google patents results.",
+        SerperTools.GOOGLE_SEARCH_AUTOCOMPLETE.value: (
+            "Fetch Google autocomplete suggestions."
+        ),
+        SerperTools.WEBPAGE_SCRAPE.value: "Scrape a webpage URL.",
+    }
 
     assert set(tools_by_name) == {tool.value for tool in SerperTools}
+    assert {
+        name: tool.description for name, tool in tools_by_name.items()
+    } == expected_tool_descriptions
 
     search_tool = tools_by_name[SerperTools.GOOGLE_SEARCH.value]
     assert search_tool.title == "Google Search"
-    assert search_tool.description == "Search Google web results through Serper."
     assert search_tool.outputSchema is not None
     assert search_tool.annotations is not None
     assert search_tool.annotations.readOnlyHint is True
     assert search_tool.annotations.destructiveHint is False
     assert search_tool.annotations.idempotentHint is False
     assert search_tool.annotations.openWorldHint is True
-    assert search_tool.inputSchema["properties"]["page"]["type"] == "integer"
-    assert search_tool.inputSchema["properties"]["num"]["type"] == "integer"
+    search_properties = search_tool.inputSchema["properties"]
+    assert search_properties["page"]["type"] == "integer"
+    assert search_properties["page"]["minimum"] == 1
+    assert search_properties["page"]["default"] == 1
+    assert search_properties["num"]["type"] == "integer"
+    assert search_properties["num"]["minimum"] == 1
+    assert search_properties["num"]["maximum"] == 100
+    assert search_properties["num"]["default"] == 10
+    expected_search_descriptions = {
+        "q": "Google search query.",
+        "gl": "Two-letter country code, such as us, uk, or ca.",
+        "location": "Search origin location, such as San Francisco, CA, USA.",
+        "hl": "Language code, such as en, es, or fr.",
+        "page": "One-based results page; 1 is the first page.",
+        "tbs": ("Google time/search filter, such as qdr:d, qdr:w, qdr:m, or qdr:y."),
+        "num": "Number of results to request.",
+    }
+    assert {
+        name: schema["description"] for name, schema in search_properties.items()
+    } == expected_search_descriptions
+
+    places_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_PLACES.value]
+    places_properties = places_tool.inputSchema["properties"]
+    assert places_properties["autocorrect"]["type"] == "boolean"
+    assert places_properties["autocorrect"]["default"] is True
+    assert places_properties["autocorrect"]["description"] == (
+        "Whether Serper should autocorrect the query."
+    )
+
+    maps_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_MAPS.value]
+    maps_properties = maps_tool.inputSchema["properties"]
+    assert maps_properties["ll"]["description"] == (
+        "Google Maps latitude, longitude, and zoom string, such as "
+        "@40.7504178,-73.9824837,14z."
+    )
+    assert maps_properties["placeId"]["description"] == (
+        "Google place ID used to target a place."
+    )
+    assert maps_properties["cid"]["description"] == (
+        "Google customer ID used to target a place."
+    )
+
+    reviews_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_REVIEWS.value]
+    reviews_properties = reviews_tool.inputSchema["properties"]
+    assert reviews_properties["fid"]["description"] == (
+        "Google reviews feature ID for the place."
+    )
+    assert reviews_properties["sortBy"]["enum"] == [
+        "mostRelevant",
+        "newest",
+        "highestRating",
+        "lowestRating",
+    ]
+    assert reviews_properties["sortBy"]["default"] == "mostRelevant"
+    assert reviews_properties["sortBy"]["description"] == (
+        "Review sort order: mostRelevant, newest, highestRating, or lowestRating."
+    )
+    assert reviews_properties["topicId"]["description"] == (
+        "Review topic ID used to filter reviews."
+    )
+    assert reviews_properties["nextPageToken"]["description"] == (
+        "Token for the next page of reviews."
+    )
+
+    lens_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_LENS.value]
+    lens_properties = lens_tool.inputSchema["properties"]
+    assert lens_properties["url"]["description"] == (
+        "Absolute image URL to search with Google Lens."
+    )
 
     scrape_tool = tools_by_name[SerperTools.WEBPAGE_SCRAPE.value]
     include_markdown_schema = scrape_tool.inputSchema["properties"]["includeMarkdown"]
     assert include_markdown_schema["type"] == "boolean"
+    assert include_markdown_schema["default"] is False
+    assert include_markdown_schema["description"] == (
+        "Include Markdown in the scrape response."
+    )
+    assert scrape_tool.inputSchema["properties"]["url"]["description"] == (
+        "Absolute URL to scrape."
+    )
 
 
 def test_google_search_returns_structured_content() -> None:

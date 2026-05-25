@@ -10,20 +10,18 @@ from pydantic import BaseModel, Field
 class BaseRequest(BaseModel):
     """Shared search request fields."""
 
-    q: str = Field(..., description="The query to search for")
+    q: str = Field(..., description="Google search query.")
     gl: str | None = Field(
-        None, description="The country to search in, e.g. us, uk, ca, au, etc."
+        None, description="Two-letter country code, such as us, uk, or ca."
     )
     location: str | None = Field(
-        None, description="The location to search in, e.g. San Francisco, CA, USA"
+        None, description="Search origin location, such as San Francisco, CA, USA."
     )
-    hl: str | None = Field(
-        None, description="The language to search in, e.g. en, es, fr, de, etc."
-    )
+    hl: str | None = Field(None, description="Language code, such as en, es, or fr.")
     page: int = Field(
         1,
         ge=1,
-        description="The page number to return, first page is 1",
+        description="One-based results page; 1 is the first page.",
     )
 
 
@@ -31,13 +29,16 @@ class SearchRequest(BaseRequest):
     """Request fields for general Serper search endpoints."""
 
     tbs: str | None = Field(
-        None, description="The time period to search in, e.g. d, w, m, y"
+        None,
+        description=(
+            "Google time/search filter, such as qdr:d, qdr:w, qdr:m, or qdr:y."
+        ),
     )
     num: int = Field(
         10,
         ge=1,
         le=100,
-        description="The number of results to return, max is 100",
+        description="Number of results to request.",
     )
 
 
@@ -46,48 +47,65 @@ class AutocorrectRequest(BaseRequest):
 
     autocorrect: bool = Field(
         True,
-        description="Automatically correct the query",
+        description="Whether Serper should autocorrect the query.",
     )
 
 
 class MapsRequest(BaseModel):
     """Request fields for Serper maps search."""
 
-    q: str = Field(..., description="The query to search for")
-    ll: str | None = Field(None, description="The GPS position & zoom level")
-    placeId: str | None = Field(None, description="The place ID to search in")
-    cid: str | None = Field(None, description="The CID to search in")
+    q: str = Field(..., description="Google search query.")
+    ll: str | None = Field(
+        None,
+        description=(
+            "Google Maps latitude, longitude, and zoom string, such as "
+            "@40.7504178,-73.9824837,14z."
+        ),
+    )
+    placeId: str | None = Field(
+        None, description="Google place ID used to target a place."
+    )
+    cid: str | None = Field(
+        None, description="Google customer ID used to target a place."
+    )
     gl: str | None = Field(
-        None, description="The country to search in, e.g. us, uk, ca, au, etc."
+        None, description="Two-letter country code, such as us, uk, or ca."
     )
-    hl: str | None = Field(
-        None, description="The language to search in, e.g. en, es, fr, de, etc."
-    )
+    hl: str | None = Field(None, description="Language code, such as en, es, or fr.")
     page: int = Field(
         1,
         ge=1,
-        description="The page number to return, first page is 1",
+        description="One-based results page; 1 is the first page.",
     )
 
 
 class ReviewsRequest(BaseModel):
     """Request fields for Serper reviews search."""
 
-    fid: str = Field(..., description="The FID")
-    cid: str | None = Field(None, description="The CID to search in")
-    placeId: str | None = Field(None, description="The place ID to search in")
+    fid: str = Field(..., description="Google reviews feature ID for the place.")
+    cid: str | None = Field(
+        None, description="Google customer ID used to target a place."
+    )
+    placeId: str | None = Field(
+        None, description="Google place ID used to target a place."
+    )
     sortBy: Literal["mostRelevant", "newest", "highestRating", "lowestRating"] = Field(
         "mostRelevant",
-        description="The sort order to use",
+        description=(
+            "Review sort order: mostRelevant, newest, highestRating, or "
+            "lowestRating."
+        ),
     )
-    topicId: str | None = Field(None, description="The topic ID to search in")
-    nextPageToken: str | None = Field(None, description="The next page token to use")
+    topicId: str | None = Field(
+        None, description="Review topic ID used to filter reviews."
+    )
+    nextPageToken: str | None = Field(
+        None, description="Token for the next page of reviews."
+    )
     gl: str | None = Field(
-        None, description="The country to search in, e.g. us, uk, ca, au, etc."
+        None, description="Two-letter country code, such as us, uk, or ca."
     )
-    hl: str | None = Field(
-        None, description="The language to search in, e.g. en, es, fr, de, etc."
-    )
+    hl: str | None = Field(None, description="Language code, such as en, es, or fr.")
 
 
 class ShoppingRequest(BaseRequest):
@@ -95,50 +113,48 @@ class ShoppingRequest(BaseRequest):
 
     autocorrect: bool = Field(
         True,
-        description="Automatically correct the query",
+        description="Whether Serper should autocorrect the query.",
     )
     num: int = Field(
         10,
         ge=1,
         le=100,
-        description="The number of results to return, max is 100",
+        description="Number of results to request.",
     )
 
 
 class LensRequest(BaseModel):
     """Request fields for Serper lens search."""
 
-    url: str = Field(..., description="The url to search")
+    url: str = Field(..., description="Absolute image URL to search with Google Lens.")
     gl: str | None = Field(
-        None, description="The country to search in, e.g. us, uk, ca, au, etc."
+        None, description="Two-letter country code, such as us, uk, or ca."
     )
-    hl: str | None = Field(
-        None, description="The language to search in, e.g. en, es, fr, de, etc."
-    )
+    hl: str | None = Field(None, description="Language code, such as en, es, or fr.")
 
 
 class PatentsRequest(BaseModel):
     """Request fields for Serper patents search."""
 
-    q: str = Field(..., description="The query to search for")
+    q: str = Field(..., description="Google search query.")
     num: int = Field(
         10,
         ge=1,
         le=100,
-        description="The number of results to return, max is 100",
+        description="Number of results to request.",
     )
     page: int = Field(
         1,
         ge=1,
-        description="The page number to return, first page is 1",
+        description="One-based results page; 1 is the first page.",
     )
 
 
 class WebpageRequest(BaseModel):
     """Request fields for Serper webpage scraping."""
 
-    url: str = Field(..., description="The url to scrape")
+    url: str = Field(..., description="Absolute URL to scrape.")
     includeMarkdown: bool = Field(
         False,
-        description="Include markdown in the response",
+        description="Include Markdown in the scrape response.",
     )

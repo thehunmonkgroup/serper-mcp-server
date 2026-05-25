@@ -7,13 +7,13 @@ import os
 from asyncio import Lock
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, Literal, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 from weakref import WeakKeyDictionary
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .core import SerperClient, SerperConfigurationError
 from .enums import SerperTools
@@ -52,6 +52,100 @@ READ_ONLY_OPEN_WEB_ANNOTATIONS = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+
+QueryParam = Annotated[
+    str,
+    Field(description="Google search query."),
+]
+CountryParam = Annotated[
+    str | None,
+    Field(description="Two-letter country code, such as us, uk, or ca."),
+]
+LocationParam = Annotated[
+    str | None,
+    Field(description="Search origin location, such as San Francisco, CA, USA."),
+]
+LanguageParam = Annotated[
+    str | None,
+    Field(description="Language code, such as en, es, or fr."),
+]
+PageParam = Annotated[
+    int,
+    Field(
+        ge=1,
+        description="One-based results page; 1 is the first page.",
+    ),
+]
+TimeFilterParam = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Google time/search filter, such as qdr:d, qdr:w, qdr:m, or qdr:y."
+        ),
+    ),
+]
+ResultCountParam = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=100,
+        description="Number of results to request.",
+    ),
+]
+AutocorrectParam = Annotated[
+    bool,
+    Field(description="Whether Serper should autocorrect the query."),
+]
+MapsLocationParam = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Google Maps latitude, longitude, and zoom string, such as "
+            "@40.7504178,-73.9824837,14z."
+        ),
+    ),
+]
+PlaceIdParam = Annotated[
+    str | None,
+    Field(description="Google place ID used to target a place."),
+]
+CustomerIdParam = Annotated[
+    str | None,
+    Field(description="Google customer ID used to target a place."),
+]
+FeatureIdParam = Annotated[
+    str,
+    Field(description="Google reviews feature ID for the place."),
+]
+ReviewSortParam = Annotated[
+    Literal["mostRelevant", "newest", "highestRating", "lowestRating"],
+    Field(
+        description=(
+            "Review sort order: mostRelevant, newest, highestRating, or "
+            "lowestRating."
+        ),
+    ),
+]
+TopicIdParam = Annotated[
+    str | None,
+    Field(description="Review topic ID used to filter reviews."),
+]
+NextPageTokenParam = Annotated[
+    str | None,
+    Field(description="Token for the next page of reviews."),
+]
+ImageUrlParam = Annotated[
+    str,
+    Field(description="Absolute image URL to search with Google Lens."),
+]
+ScrapeUrlParam = Annotated[
+    str,
+    Field(description="Absolute URL to scrape."),
+]
+IncludeMarkdownParam = Annotated[
+    bool,
+    Field(description="Include Markdown in the scrape response."),
+]
 
 logger = logging.getLogger(__name__)
 RequestModelT = TypeVar("RequestModelT", bound=BaseModel)
@@ -424,16 +518,16 @@ class SerperMcpApplication:
         """
 
         async def google_search(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            tbs: str | None = None,
-            num: int = 10,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            tbs: TimeFilterParam = None,
+            num: ResultCountParam = 10,
         ) -> dict[str, Any]:
-            """Search Google web results through Serper."""
+            """Search Google web results."""
 
             request = self.build_request(
                 SearchRequest,
@@ -452,16 +546,16 @@ class SerperMcpApplication:
             )
 
         async def google_search_images(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            tbs: str | None = None,
-            num: int = 10,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            tbs: TimeFilterParam = None,
+            num: ResultCountParam = 10,
         ) -> dict[str, Any]:
-            """Search Google image results through Serper."""
+            """Search Google image results."""
 
             request = self.build_request(
                 SearchRequest,
@@ -480,16 +574,16 @@ class SerperMcpApplication:
             )
 
         async def google_search_videos(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            tbs: str | None = None,
-            num: int = 10,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            tbs: TimeFilterParam = None,
+            num: ResultCountParam = 10,
         ) -> dict[str, Any]:
-            """Search Google video results through Serper."""
+            """Search Google video results."""
 
             request = self.build_request(
                 SearchRequest,
@@ -508,16 +602,16 @@ class SerperMcpApplication:
             )
 
         async def google_search_news(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            tbs: str | None = None,
-            num: int = 10,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            tbs: TimeFilterParam = None,
+            num: ResultCountParam = 10,
         ) -> dict[str, Any]:
-            """Search Google news results through Serper."""
+            """Search Google news results."""
 
             request = self.build_request(
                 SearchRequest,
@@ -539,7 +633,7 @@ class SerperMcpApplication:
             google_search,
             name=SerperTools.GOOGLE_SEARCH.value,
             title="Google Search",
-            description="Search Google web results through Serper.",
+            description="Search Google web results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -547,7 +641,7 @@ class SerperMcpApplication:
             google_search_images,
             name=SerperTools.GOOGLE_SEARCH_IMAGES.value,
             title="Google Image Search",
-            description="Search Google image results through Serper.",
+            description="Search Google image results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -555,7 +649,7 @@ class SerperMcpApplication:
             google_search_videos,
             name=SerperTools.GOOGLE_SEARCH_VIDEOS.value,
             title="Google Video Search",
-            description="Search Google video results through Serper.",
+            description="Search Google video results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -563,7 +657,7 @@ class SerperMcpApplication:
             google_search_news,
             name=SerperTools.GOOGLE_SEARCH_NEWS.value,
             title="Google News Search",
-            description="Search Google news results through Serper.",
+            description="Search Google news results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -576,15 +670,15 @@ class SerperMcpApplication:
         """
 
         async def google_search_places(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            autocorrect: bool = True,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            autocorrect: AutocorrectParam = True,
         ) -> dict[str, Any]:
-            """Search Google places results through Serper."""
+            """Search Google places results."""
 
             request = self.build_request(
                 AutocorrectRequest,
@@ -602,15 +696,15 @@ class SerperMcpApplication:
             )
 
         async def google_search_scholar(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            autocorrect: bool = True,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            autocorrect: AutocorrectParam = True,
         ) -> dict[str, Any]:
-            """Search Google Scholar results through Serper."""
+            """Search Google Scholar results."""
 
             request = self.build_request(
                 AutocorrectRequest,
@@ -628,15 +722,15 @@ class SerperMcpApplication:
             )
 
         async def google_search_autocomplete(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            autocorrect: bool = True,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            autocorrect: AutocorrectParam = True,
         ) -> dict[str, Any]:
-            """Fetch Google autocomplete suggestions through Serper."""
+            """Fetch Google autocomplete suggestions."""
 
             request = self.build_request(
                 AutocorrectRequest,
@@ -657,7 +751,7 @@ class SerperMcpApplication:
             google_search_places,
             name=SerperTools.GOOGLE_SEARCH_PLACES.value,
             title="Google Places Search",
-            description="Search Google places results through Serper.",
+            description="Search Google places results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -665,7 +759,7 @@ class SerperMcpApplication:
             google_search_scholar,
             name=SerperTools.GOOGLE_SEARCH_SCHOLAR.value,
             title="Google Scholar Search",
-            description="Search Google Scholar results through Serper.",
+            description="Search Google Scholar results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -673,7 +767,7 @@ class SerperMcpApplication:
             google_search_autocomplete,
             name=SerperTools.GOOGLE_SEARCH_AUTOCOMPLETE.value,
             title="Google Autocomplete",
-            description="Fetch Google autocomplete suggestions through Serper.",
+            description="Fetch Google autocomplete suggestions.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -686,16 +780,16 @@ class SerperMcpApplication:
         """
 
         async def google_search_maps(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            ll: str | None = None,
-            placeId: str | None = None,
-            cid: str | None = None,
-            gl: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
+            ll: MapsLocationParam = None,
+            placeId: PlaceIdParam = None,
+            cid: CustomerIdParam = None,
+            gl: CountryParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
         ) -> dict[str, Any]:
-            """Search Google Maps results through Serper."""
+            """Search Google Maps results."""
 
             request = self.build_request(
                 MapsRequest,
@@ -717,7 +811,7 @@ class SerperMcpApplication:
             google_search_maps,
             name=SerperTools.GOOGLE_SEARCH_MAPS.value,
             title="Google Maps Search",
-            description="Search Google Maps results through Serper.",
+            description="Search Google Maps results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -730,19 +824,17 @@ class SerperMcpApplication:
         """
 
         async def google_search_reviews(
-            fid: str,
+            fid: FeatureIdParam,
             ctx: Context[Any, Any, Any],
-            cid: str | None = None,
-            placeId: str | None = None,
-            sortBy: Literal[
-                "mostRelevant", "newest", "highestRating", "lowestRating"
-            ] = "mostRelevant",
-            topicId: str | None = None,
-            nextPageToken: str | None = None,
-            gl: str | None = None,
-            hl: str | None = None,
+            cid: CustomerIdParam = None,
+            placeId: PlaceIdParam = None,
+            sortBy: ReviewSortParam = "mostRelevant",
+            topicId: TopicIdParam = None,
+            nextPageToken: NextPageTokenParam = None,
+            gl: CountryParam = None,
+            hl: LanguageParam = None,
         ) -> dict[str, Any]:
-            """Search Google review results through Serper."""
+            """Search Google review results."""
 
             request = self.build_request(
                 ReviewsRequest,
@@ -765,7 +857,7 @@ class SerperMcpApplication:
             google_search_reviews,
             name=SerperTools.GOOGLE_SEARCH_REVIEWS.value,
             title="Google Reviews Search",
-            description="Search Google review results through Serper.",
+            description="Search Google review results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -778,16 +870,16 @@ class SerperMcpApplication:
         """
 
         async def google_search_shopping(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            location: str | None = None,
-            hl: str | None = None,
-            page: int = 1,
-            autocorrect: bool = True,
-            num: int = 10,
+            gl: CountryParam = None,
+            location: LocationParam = None,
+            hl: LanguageParam = None,
+            page: PageParam = 1,
+            autocorrect: AutocorrectParam = True,
+            num: ResultCountParam = 10,
         ) -> dict[str, Any]:
-            """Search Google shopping results through Serper."""
+            """Search Google shopping results."""
 
             request = self.build_request(
                 ShoppingRequest,
@@ -809,7 +901,7 @@ class SerperMcpApplication:
             google_search_shopping,
             name=SerperTools.GOOGLE_SEARCH_SHOPPING.value,
             title="Google Shopping Search",
-            description="Search Google shopping results through Serper.",
+            description="Search Google shopping results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -822,12 +914,12 @@ class SerperMcpApplication:
         """
 
         async def google_search_lens(
-            url: str,
+            url: ImageUrlParam,
             ctx: Context[Any, Any, Any],
-            gl: str | None = None,
-            hl: str | None = None,
+            gl: CountryParam = None,
+            hl: LanguageParam = None,
         ) -> dict[str, Any]:
-            """Search Google Lens results through Serper."""
+            """Search Google Lens results from an image URL."""
 
             request = self.build_request(LensRequest, url=url, gl=gl, hl=hl)
             return await self.execute_google_tool(
@@ -840,7 +932,7 @@ class SerperMcpApplication:
             google_search_lens,
             name=SerperTools.GOOGLE_SEARCH_LENS.value,
             title="Google Lens Search",
-            description="Search Google Lens results from an image URL through Serper.",
+            description="Search Google Lens results from an image URL.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -853,12 +945,12 @@ class SerperMcpApplication:
         """
 
         async def google_search_patents(
-            q: str,
+            q: QueryParam,
             ctx: Context[Any, Any, Any],
-            num: int = 10,
-            page: int = 1,
+            num: ResultCountParam = 10,
+            page: PageParam = 1,
         ) -> dict[str, Any]:
-            """Search Google patents results through Serper."""
+            """Search Google patents results."""
 
             request = self.build_request(PatentsRequest, q=q, num=num, page=page)
             return await self.execute_google_tool(
@@ -871,7 +963,7 @@ class SerperMcpApplication:
             google_search_patents,
             name=SerperTools.GOOGLE_SEARCH_PATENTS.value,
             title="Google Patents Search",
-            description="Search Google patents results through Serper.",
+            description="Search Google patents results.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
@@ -884,11 +976,11 @@ class SerperMcpApplication:
         """
 
         async def webpage_scrape(
-            url: str,
+            url: ScrapeUrlParam,
             ctx: Context[Any, Any, Any],
-            includeMarkdown: bool = False,
+            includeMarkdown: IncludeMarkdownParam = False,
         ) -> dict[str, Any]:
-            """Scrape a webpage through Serper."""
+            """Scrape a webpage URL."""
 
             request = self.build_request(
                 WebpageRequest,
@@ -905,7 +997,7 @@ class SerperMcpApplication:
             webpage_scrape,
             name=SerperTools.WEBPAGE_SCRAPE.value,
             title="Webpage Scrape",
-            description="Scrape a webpage URL through Serper.",
+            description="Scrape a webpage URL.",
             annotations=READ_ONLY_OPEN_WEB_ANNOTATIONS,
             structured_output=True,
         )
