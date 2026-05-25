@@ -9,10 +9,10 @@ import pytest
 
 from serper_mcp_server.core import (
     GOOGLE_SERPER_BASE_URL,
-    AIOHTTP_TIMEOUT_ENV_VAR,
     DEFAULT_AIOHTTP_TIMEOUT_SECONDS,
     SCRAPE_SERPER_URL,
     SERPER_API_KEY_ENV_VAR,
+    SERPER_REQUEST_TIMEOUT_ENV_VAR,
     SerperClient,
     SerperClientError,
     SerperConfigurationError,
@@ -155,10 +155,21 @@ def test_timeout_default_is_used(
 ) -> None:
     """The default timeout is used when no environment value exists."""
 
-    monkeypatch.delenv(AIOHTTP_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(SERPER_REQUEST_TIMEOUT_ENV_VAR, raising=False)
     client = SerperClient(api_key="test-key")
 
-    assert client.timeout_seconds == DEFAULT_AIOHTTP_TIMEOUT_SECONDS
+    assert client.timeout_seconds == DEFAULT_AIOHTTP_TIMEOUT_SECONDS == 30
+
+
+def test_timeout_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout can be overridden with a positive integer."""
+
+    monkeypatch.setenv(SERPER_REQUEST_TIMEOUT_ENV_VAR, "45")
+    client = SerperClient(api_key="test-key")
+
+    assert client.timeout_seconds == 45
 
 
 def test_invalid_timeout_raises_configuration_error(
@@ -166,10 +177,24 @@ def test_invalid_timeout_raises_configuration_error(
 ) -> None:
     """Invalid timeout configuration is reported clearly."""
 
-    monkeypatch.setenv(AIOHTTP_TIMEOUT_ENV_VAR, "invalid")
+    monkeypatch.setenv(SERPER_REQUEST_TIMEOUT_ENV_VAR, "invalid")
     client = SerperClient(api_key="test-key")
 
     with pytest.raises(SerperConfigurationError, match="must be an integer"):
+        _ = client.timeout_seconds
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_non_positive_timeout_raises_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    """Non-positive timeout configuration is rejected."""
+
+    monkeypatch.setenv(SERPER_REQUEST_TIMEOUT_ENV_VAR, value)
+    client = SerperClient(api_key="test-key")
+
+    with pytest.raises(SerperConfigurationError, match="must be greater than 0"):
         _ = client.timeout_seconds
 
 

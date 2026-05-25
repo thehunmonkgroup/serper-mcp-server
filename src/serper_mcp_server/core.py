@@ -17,11 +17,11 @@ from .enums import SerperTools
 from .metrics import MetricEvent, MetricsRecorder, NullMetricsRecorder
 from .schemas import WebpageRequest
 
-DEFAULT_AIOHTTP_TIMEOUT_SECONDS = 15
+DEFAULT_AIOHTTP_TIMEOUT_SECONDS = 30
 GOOGLE_SERPER_BASE_URL = "https://google.serper.dev"
 SCRAPE_SERPER_URL = "https://scrape.serper.dev"
 SERPER_API_KEY_ENV_VAR = "SERPER_API_KEY"
-AIOHTTP_TIMEOUT_ENV_VAR = "AIOHTTP_TIMEOUT"
+SERPER_REQUEST_TIMEOUT_ENV_VAR = "SERPER_REQUEST_TIMEOUT"
 
 logger = logging.getLogger(__name__)
 
@@ -364,18 +364,18 @@ class SerperClient:
             return self._timeout_seconds
 
         value = os.getenv(
-            AIOHTTP_TIMEOUT_ENV_VAR,
+            SERPER_REQUEST_TIMEOUT_ENV_VAR,
             str(DEFAULT_AIOHTTP_TIMEOUT_SECONDS),
         ).strip()
         try:
             timeout_seconds = int(value)
         except ValueError as exc:
             raise SerperConfigurationError(
-                f"{AIOHTTP_TIMEOUT_ENV_VAR} must be an integer"
+                f"{SERPER_REQUEST_TIMEOUT_ENV_VAR} must be an integer"
             ) from exc
         if timeout_seconds <= 0:
             raise SerperConfigurationError(
-                f"{AIOHTTP_TIMEOUT_ENV_VAR} must be greater than 0"
+                f"{SERPER_REQUEST_TIMEOUT_ENV_VAR} must be greater than 0"
             )
         return timeout_seconds
 
