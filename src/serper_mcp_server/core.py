@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import ssl
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from time import perf_counter
 from typing import Any
 
@@ -21,6 +22,7 @@ DEFAULT_AIOHTTP_TIMEOUT_SECONDS = 30
 GOOGLE_SERPER_BASE_URL = "https://google.serper.dev"
 SCRAPE_SERPER_URL = "https://scrape.serper.dev"
 SERPER_API_KEY_ENV_VAR = "SERPER_API_KEY"
+SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR = "SERPER_MAX_CONCURRENT_REQUESTS"
 SERPER_REQUEST_TIMEOUT_ENV_VAR = "SERPER_REQUEST_TIMEOUT"
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,67 @@ class SerperConfigurationError(SerperClientError):
     """Error raised when server configuration is invalid or incomplete."""
 
 
+class SerperConcurrencyLimitError(SerperClientError):
+    """Error raised when all outbound Serper request slots are active."""
+
+
+class ConcurrentRequestLimiter:
+    """Fail-fast concurrency gate for outbound Serper API requests.
+
+    :param maximum_requests: Maximum active requests, or ``None`` for no
+        application-level limit.
+    :type maximum_requests: int | None
+    """
+
+    def __init__(self, maximum_requests: int | None) -> None:
+        self.maximum_requests: int | None = maximum_requests
+        self.active_requests: int = 0
+
+    @contextmanager
+    def claim_request_slot(self) -> Iterator[None]:
+        """Claim an outbound request slot without waiting.
+
+        State transitions are synchronous because an aiohttp client and its
+        event loop execute task code cooperatively between await points.
+
+        :return: Context manager that releases the claimed request slot.
+        :rtype: Iterator[None]
+        :raises SerperConcurrencyLimitError: If every slot is active.
+        """
+
+        if (
+            self.maximum_requests is not None
+            and self.active_requests >= self.maximum_requests
+        ):
+            message = self.build_limit_message(self.maximum_requests)
+            logger.warning(message)
+            raise SerperConcurrencyLimitError(message)
+
+        self.active_requests += 1
+        try:
+            yield
+        finally:
+            self.active_requests -= 1
+
+    @staticmethod
+    def build_limit_message(maximum_requests: int) -> str:
+        """Build the model-directed concurrency warning.
+
+        :param maximum_requests: Configured concurrent request limit.
+        :type maximum_requests: int
+        :return: Warning explaining how the caller should retry.
+        :rtype: str
+        """
+
+        return (
+            "WARNING: The maximum of "
+            f"{maximum_requests} simultaneous Serper requests has been reached. "
+            "This request was not submitted or queued. Submit no more than "
+            f"{maximum_requests} Serper tool calls at a time, then retry after "
+            "an active request finishes."
+        )
+
+
 class SerperClient:
     """Reusable asynchronous Serper API client.
 
@@ -59,6 +122,9 @@ class SerperClient:
     :type session: aiohttp.ClientSession | None
     :param metrics: Optional metrics recorder.
     :type metrics: MetricsRecorder | None
+    :param max_concurrent_requests: Maximum simultaneous outbound requests.
+        When omitted, it is read from the environment.
+    :type max_concurrent_requests: int | None
     """
 
     def __init__(
@@ -67,12 +133,19 @@ class SerperClient:
         timeout_seconds: int | None = None,
         session: aiohttp.ClientSession | None = None,
         metrics: MetricsRecorder | None = None,
+        max_concurrent_requests: int | None = None,
     ) -> None:
         self._api_key: str | None = api_key
         self._timeout_seconds: int | None = timeout_seconds
         self._session: aiohttp.ClientSession | None = session
         self._owns_session: bool = session is None
         self.metrics: MetricsRecorder = metrics or NullMetricsRecorder()
+        self.max_concurrent_requests: int | None = self.load_max_concurrent_requests(
+            max_concurrent_requests
+        )
+        self.concurrent_request_limiter: ConcurrentRequestLimiter = (
+            ConcurrentRequestLimiter(self.max_concurrent_requests)
+        )
 
     async def google(self, tool: SerperTools, request: BaseModel) -> dict[str, Any]:
         """Search a Google-backed Serper endpoint.
@@ -184,34 +257,35 @@ class SerperClient:
         logger.debug("Posting Serper request to %s", url)
 
         try:
-            async with session.post(
-                url,
-                headers=self.headers,
-                json=payload,
-            ) as response:
-                response_text = await response.text()
-                if response.status >= 400:
-                    raise SerperClientError(
-                        (
-                            f"Serper API returned HTTP {response.status}: "
-                            f"{response_text[:500]}"
-                        ),
-                        response.status,
-                    )
-                try:
-                    json_body = await response.json(content_type=None)
-                except aiohttp.ContentTypeError as exc:
-                    raise SerperClientError(
-                        "Serper API returned a non-JSON response",
-                        response.status,
-                    ) from exc
-                status_code = response.status
-                if not isinstance(json_body, dict):
-                    raise SerperClientError(
-                        "Serper API returned an unexpected JSON shape",
-                        status_code,
-                    )
-                return json_body, status_code
+            with self.concurrent_request_limiter.claim_request_slot():
+                async with session.post(
+                    url,
+                    headers=self.headers,
+                    json=payload,
+                ) as response:
+                    response_text = await response.text()
+                    if response.status >= 400:
+                        raise SerperClientError(
+                            (
+                                f"Serper API returned HTTP {response.status}: "
+                                f"{response_text[:500]}"
+                            ),
+                            response.status,
+                        )
+                    try:
+                        json_body = await response.json(content_type=None)
+                    except aiohttp.ContentTypeError as exc:
+                        raise SerperClientError(
+                            "Serper API returned a non-JSON response",
+                            response.status,
+                        ) from exc
+                    status_code = response.status
+                    if not isinstance(json_body, dict):
+                        raise SerperClientError(
+                            "Serper API returned an unexpected JSON shape",
+                            status_code,
+                        )
+                    return json_body, status_code
         except TimeoutError as exc:
             logger.warning("Serper request timed out: %s", url)
             raise SerperClientError("Serper API request timed out") from exc
@@ -322,7 +396,13 @@ class SerperClient:
 
         if self._session is None or self._session.closed:
             ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            if self.max_concurrent_requests is None:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+            else:
+                connector = aiohttp.TCPConnector(
+                    ssl=ssl_context,
+                    limit=self.max_concurrent_requests,
+                )
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self._session = aiohttp.ClientSession(
                 connector=connector,
@@ -391,6 +471,40 @@ class SerperClient:
             "X-API-KEY": self.api_key,
             "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def load_max_concurrent_requests(configured_value: int | None) -> int | None:
+        """Load and validate the outbound concurrency limit.
+
+        :param configured_value: Explicit maximum, or ``None`` to read the
+            environment.
+        :type configured_value: int | None
+        :return: Positive concurrency limit, or ``None`` when disabled.
+        :rtype: int | None
+        :raises SerperConfigurationError: If the configured value is not a
+            positive integer.
+        """
+
+        error_message = (
+            f"{SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR} must be a positive integer"
+        )
+
+        if configured_value is not None:
+            if configured_value <= 0:
+                raise SerperConfigurationError(error_message)
+            return configured_value
+
+        if SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR not in os.environ:
+            return None
+
+        raw_value = os.environ[SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR]
+        try:
+            maximum_requests = int(raw_value)
+        except ValueError as exc:
+            raise SerperConfigurationError(error_message) from exc
+        if maximum_requests <= 0:
+            raise SerperConfigurationError(error_message)
+        return maximum_requests
 
 
 def elapsed_ms(started_at: float) -> float:

@@ -6,15 +6,18 @@ import asyncio
 from typing import Any, cast
 
 import pytest
+from typing_extensions import override
 
 from serper_mcp_server.core import (
-    GOOGLE_SERPER_BASE_URL,
     DEFAULT_AIOHTTP_TIMEOUT_SECONDS,
+    GOOGLE_SERPER_BASE_URL,
     SCRAPE_SERPER_URL,
     SERPER_API_KEY_ENV_VAR,
+    SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR,
     SERPER_REQUEST_TIMEOUT_ENV_VAR,
     SerperClient,
     SerperClientError,
+    SerperConcurrencyLimitError,
     SerperConfigurationError,
 )
 from serper_mcp_server.enums import SerperTools
@@ -107,6 +110,97 @@ class FakeSession:
         return self.response
 
 
+class BlockingResponse(FakeResponse):
+    """Fake response that remains active until its session releases it.
+
+    :param session: Session tracking active fake HTTP requests.
+    :type session: BlockingSession
+    """
+
+    def __init__(self, session: BlockingSession) -> None:
+        super().__init__(json_body={"organic": []})
+        self.session: BlockingSession = session
+        self.entered: bool = False
+
+    @override
+    async def __aenter__(self) -> BlockingResponse:
+        """Start and block a fake HTTP request.
+
+        :return: Active fake response.
+        :rtype: BlockingResponse
+        """
+
+        self.entered = True
+        self.session.active_requests += 1
+        self.session.maximum_active_requests = max(
+            self.session.maximum_active_requests,
+            self.session.active_requests,
+        )
+        if self.session.active_requests >= self.session.expected_active_requests:
+            self.session.expected_requests_started.set()
+        try:
+            await self.session.release_requests.wait()
+        except BaseException:
+            self.session.active_requests -= 1
+            self.entered = False
+            raise
+        return self
+
+    @override
+    async def __aexit__(self, *_args: object) -> None:
+        """Finish a fake HTTP request.
+
+        :return: None.
+        :rtype: None
+        """
+
+        if self.entered:
+            self.session.active_requests -= 1
+            self.entered = False
+
+
+class BlockingSession:
+    """Fake session that tracks and blocks simultaneous requests.
+
+    :param expected_active_requests: Number of active requests that signals
+        readiness.
+    :type expected_active_requests: int
+    """
+
+    closed: bool = False
+
+    def __init__(self, expected_active_requests: int) -> None:
+        self.expected_active_requests: int = expected_active_requests
+        self.active_requests: int = 0
+        self.maximum_active_requests: int = 0
+        self.submitted_urls: list[str] = []
+        self.expected_requests_started: asyncio.Event = asyncio.Event()
+        self.release_requests: asyncio.Event = asyncio.Event()
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> BlockingResponse:
+        """Create a blocking fake response and record its URL.
+
+        :param url: Request URL.
+        :type url: str
+        :param headers: Request headers.
+        :type headers: dict[str, str]
+        :param json: Request JSON payload.
+        :type json: dict[str, Any]
+        :return: Blocking response context manager.
+        :rtype: BlockingResponse
+        """
+
+        _ = headers, json
+        self.submitted_urls.append(url)
+        return BlockingResponse(self)
+
+
 class FakeMetricsRecorder:
     """Metrics recorder test double."""
 
@@ -123,6 +217,19 @@ class FakeMetricsRecorder:
         """
 
         self.events.append(event)
+
+
+@pytest.fixture(autouse=True)
+def clear_concurrency_limit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear concurrency configuration unless a test sets it explicitly.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :type monkeypatch: pytest.MonkeyPatch
+    :return: None.
+    :rtype: None
+    """
+
+    monkeypatch.delenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, raising=False)
 
 
 def run_async(awaitable: Any) -> Any:
@@ -196,6 +303,48 @@ def test_non_positive_timeout_raises_configuration_error(
 
     with pytest.raises(SerperConfigurationError, match="must be greater than 0"):
         _ = client.timeout_seconds
+
+
+@pytest.mark.parametrize("limit_value", ["invalid", "0", "-1"])
+def test_invalid_max_concurrent_requests_fails_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_value: str,
+) -> None:
+    """Invalid concurrency limits fail client creation clearly.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :type monkeypatch: pytest.MonkeyPatch
+    :param limit_value: Invalid environment value.
+    :type limit_value: str
+    :return: None.
+    :rtype: None
+    """
+
+    monkeypatch.setenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, limit_value)
+
+    with pytest.raises(
+        SerperConfigurationError,
+        match=(f"{SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR} must be a positive integer"),
+    ):
+        SerperClient(api_key="test-key")
+
+
+def test_connector_limit_matches_configured_concurrency() -> None:
+    """The HTTP connection pool does not impose a lower hidden queue limit."""
+
+    async def inspect_connector_limit() -> int:
+        client = SerperClient(
+            api_key="test-key",
+            max_concurrent_requests=125,
+        )
+        try:
+            session = await client.get_session()
+            assert session.connector is not None
+            return session.connector.limit
+        finally:
+            await client.close()
+
+    assert run_async(inspect_connector_limit()) == 125
 
 
 def test_google_uses_serper_post_endpoint() -> None:
@@ -404,3 +553,98 @@ def test_google_records_failed_search_metric() -> None:
     assert event.query == "openai"
     assert event.error is not None
     assert "rate limited" in event.error
+
+
+def test_concurrency_limit_is_shared_and_rejects_without_queueing() -> None:
+    """Search and scrape share one fail-fast outbound request limit."""
+
+    async def exercise_concurrency_limit() -> tuple[
+        BlockingSession,
+        SerperConcurrencyLimitError,
+    ]:
+        session = BlockingSession(expected_active_requests=2)
+        client = SerperClient(
+            api_key="test-key",
+            session=cast(Any, session),
+            max_concurrent_requests=2,
+        )
+        search_request = SearchRequest(
+            q="openai",
+            gl=None,
+            location=None,
+            hl=None,
+            page=1,
+            tbs=None,
+            num=5,
+        )
+        scrape_request = WebpageRequest(
+            url="https://example.com",
+            includeMarkdown=False,
+        )
+        search_task = asyncio.create_task(
+            client.google(SerperTools.GOOGLE_SEARCH, search_request)
+        )
+        scrape_task = asyncio.create_task(client.scrape(scrape_request))
+        await asyncio.wait_for(session.expected_requests_started.wait(), timeout=1)
+
+        with pytest.raises(SerperConcurrencyLimitError) as error_info:
+            await asyncio.wait_for(
+                client.google(SerperTools.GOOGLE_SEARCH, search_request),
+                timeout=0.1,
+            )
+
+        assert len(session.submitted_urls) == 2
+        session.release_requests.set()
+        await asyncio.gather(search_task, scrape_task)
+        await client.google(SerperTools.GOOGLE_SEARCH, search_request)
+        return session, error_info.value
+
+    session, error = run_async(exercise_concurrency_limit())
+
+    assert session.maximum_active_requests == 2
+    assert session.submitted_urls == [
+        f"{GOOGLE_SERPER_BASE_URL}/search",
+        SCRAPE_SERPER_URL,
+        f"{GOOGLE_SERPER_BASE_URL}/search",
+    ]
+    assert "WARNING: The maximum of 2 simultaneous" in str(error)
+    assert "not submitted or queued" in str(error)
+    assert "Submit no more than 2" in str(error)
+
+
+def test_cancelled_request_releases_concurrency_slot() -> None:
+    """Cancellation returns an outbound request slot to the shared limiter."""
+
+    async def cancel_and_retry() -> tuple[int, int]:
+        session = BlockingSession(expected_active_requests=1)
+        client = SerperClient(
+            api_key="test-key",
+            session=cast(Any, session),
+            max_concurrent_requests=1,
+        )
+        request = SearchRequest(
+            q="openai",
+            gl=None,
+            location=None,
+            hl=None,
+            page=1,
+            tbs=None,
+            num=5,
+        )
+        request_task = asyncio.create_task(
+            client.google(SerperTools.GOOGLE_SEARCH, request)
+        )
+        await asyncio.wait_for(session.expected_requests_started.wait(), timeout=1)
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        active_requests_after_cancellation = (
+            client.concurrent_request_limiter.active_requests
+        )
+        session.release_requests.set()
+        await client.google(SerperTools.GOOGLE_SEARCH, request)
+        active_requests_after_retry = client.concurrent_request_limiter.active_requests
+        return active_requests_after_cancellation, active_requests_after_retry
+
+    assert run_async(cancel_and_retry()) == (0, 0)

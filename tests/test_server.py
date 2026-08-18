@@ -10,6 +10,7 @@ import pytest
 from typing_extensions import override
 
 from serper_mcp_server.core import (
+    SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR,
     SerperClient,
     SerperClientError,
     SerperConfigurationError,
@@ -129,6 +130,74 @@ class IntermittentFailingSerperClient(FakeSerperClient):
         return await super().google(tool, request)
 
 
+class BlockingSerperClient(FakeSerperClient):
+    """Client test double that exposes simultaneous tool execution.
+
+    :param expected_active_calls: Number of active calls that signals readiness.
+    :type expected_active_calls: int
+    """
+
+    def __init__(self, expected_active_calls: int) -> None:
+        super().__init__()
+        self.expected_active_calls: int = expected_active_calls
+        self.active_calls: int = 0
+        self.maximum_active_calls: int = 0
+        self.expected_calls_started: asyncio.Event = asyncio.Event()
+        self.release_calls: asyncio.Event = asyncio.Event()
+
+    async def wait_for_release(self) -> None:
+        """Run one tracked call until the test releases it.
+
+        :return: None.
+        :rtype: None
+        """
+
+        with self.concurrent_request_limiter.claim_request_slot():
+            self.active_calls += 1
+            self.maximum_active_calls = max(
+                self.maximum_active_calls,
+                self.active_calls,
+            )
+            if self.active_calls >= self.expected_active_calls:
+                self.expected_calls_started.set()
+            try:
+                await self.release_calls.wait()
+            finally:
+                self.active_calls -= 1
+
+    @override
+    async def google(
+        self,
+        tool: SerperTools,
+        request: Any,
+    ) -> dict[str, Any]:
+        """Block and then return a fake Google response.
+
+        :param tool: Serper tool enum value.
+        :type tool: SerperTools
+        :param request: Validated request model.
+        :type request: Any
+        :return: Fake Serper response.
+        :rtype: dict[str, Any]
+        """
+
+        await self.wait_for_release()
+        return await super().google(tool, request)
+
+    @override
+    async def scrape(self, request: WebpageRequest) -> dict[str, Any]:
+        """Block and then return a fake scrape response.
+
+        :param request: Validated webpage request.
+        :type request: WebpageRequest
+        :return: Fake Serper scrape response.
+        :rtype: dict[str, Any]
+        """
+
+        await self.wait_for_release()
+        return await super().scrape(request)
+
+
 class FakeMetricsService:
     """Metrics service test double."""
 
@@ -174,6 +243,7 @@ def clear_session_limit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for tool_name in SerperTools:
         env_var_name = SerperMcpApplication.session_limit_env_var_name(tool_name)
         monkeypatch.delenv(env_var_name, raising=False)
+    monkeypatch.delenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, raising=False)
 
 
 def run_async(awaitable: Any) -> Any:
@@ -205,15 +275,33 @@ def call_tool_result(
     :rtype: types.CallToolResult
     """
 
+    return run_async(call_tool_result_async(mcp_server, tool_name, arguments))
+
+
+async def call_tool_result_async(
+    mcp_server: Any,
+    tool_name: SerperTools,
+    arguments: dict[str, Any],
+) -> types.CallToolResult:
+    """Call a tool asynchronously through the low-level request handler.
+
+    :param mcp_server: FastMCP server instance.
+    :type mcp_server: Any
+    :param tool_name: Tool to call.
+    :type tool_name: SerperTools
+    :param arguments: Tool arguments.
+    :type arguments: dict[str, Any]
+    :return: MCP call tool result.
+    :rtype: types.CallToolResult
+    """
+
     low_level_server = getattr(mcp_server, "_mcp_server")
     handler = low_level_server.request_handlers[types.CallToolRequest]
-    result = run_async(
-        handler(
-            types.CallToolRequest(
-                params=types.CallToolRequestParams(
-                    name=tool_name.value,
-                    arguments=arguments,
-                )
+    result = await handler(
+        types.CallToolRequest(
+            params=types.CallToolRequestParams(
+                name=tool_name.value,
+                arguments=arguments,
             )
         )
     )
@@ -482,6 +570,152 @@ def test_google_search_session_limit_errors_after_success(
     second_result_text = call_tool_text(second_result)
     assert "usage limit reached" in second_result_text
     assert "Do not call google_search again" in second_result_text
+
+
+def test_session_limit_allows_calls_to_run_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session quota reservations do not serialize outbound tool calls."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "2",
+    )
+    client = BlockingSerperClient(expected_active_calls=2)
+    mcp_server = create_mcp_server(client)
+
+    async def exercise_session_limit() -> list[types.CallToolResult]:
+        first_call = asyncio.create_task(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "first"},
+            )
+        )
+        second_call = asyncio.create_task(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "second"},
+            )
+        )
+        await asyncio.wait_for(client.expected_calls_started.wait(), timeout=1)
+        limited_result = await asyncio.wait_for(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "third"},
+            ),
+            timeout=0.1,
+        )
+        client.release_calls.set()
+        completed_results = await asyncio.gather(first_call, second_call)
+        return [*completed_results, limited_result]
+
+    first_result, second_result, limited_result = run_async(exercise_session_limit())
+
+    assert client.maximum_active_calls == 2
+    assert first_result.isError is False
+    assert second_result.isError is False
+    assert limited_result.isError is True
+    assert "usage limit reached" in call_tool_text(limited_result)
+
+
+def test_cancelled_call_releases_session_limit_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation returns reserved session quota for a later call."""
+
+    monkeypatch.setenv(
+        SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
+        "1",
+    )
+    client = BlockingSerperClient(expected_active_calls=1)
+    mcp_server = create_mcp_server(client)
+
+    async def cancel_and_retry() -> types.CallToolResult:
+        cancelled_call = asyncio.create_task(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "cancelled"},
+            )
+        )
+        await asyncio.wait_for(client.expected_calls_started.wait(), timeout=1)
+        cancelled_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_call
+
+        client.release_calls.set()
+        return await call_tool_result_async(
+            mcp_server,
+            SerperTools.GOOGLE_SEARCH,
+            {"q": "retry"},
+        )
+
+    retry_result = run_async(cancel_and_retry())
+
+    assert retry_result.isError is False
+
+
+def test_global_concurrency_limit_replies_with_warning_without_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed tools share one fail-fast concurrent request limit."""
+
+    monkeypatch.setenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, "2")
+    client = BlockingSerperClient(expected_active_calls=2)
+    mcp_server = create_mcp_server(client)
+
+    async def exercise_concurrency_limit() -> tuple[
+        types.CallToolResult,
+        tuple[types.CallToolResult, types.CallToolResult],
+        types.CallToolResult,
+    ]:
+        search_call = asyncio.create_task(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "first"},
+            )
+        )
+        scrape_call = asyncio.create_task(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.WEBPAGE_SCRAPE,
+                {"url": "https://example.com"},
+            )
+        )
+        await asyncio.wait_for(client.expected_calls_started.wait(), timeout=1)
+        rejected_result = await asyncio.wait_for(
+            call_tool_result_async(
+                mcp_server,
+                SerperTools.GOOGLE_SEARCH,
+                {"q": "rejected"},
+            ),
+            timeout=0.1,
+        )
+        client.release_calls.set()
+        completed_results = await asyncio.gather(search_call, scrape_call)
+        retry_result = await call_tool_result_async(
+            mcp_server,
+            SerperTools.GOOGLE_SEARCH,
+            {"q": "retry"},
+        )
+        return rejected_result, completed_results, retry_result
+
+    rejected_result, completed_results, retry_result = run_async(
+        exercise_concurrency_limit()
+    )
+
+    assert client.maximum_active_calls == 2
+    assert rejected_result.isError is True
+    warning_text = call_tool_text(rejected_result)
+    assert "WARNING: The maximum of 2 simultaneous" in warning_text
+    assert "not submitted or queued" in warning_text
+    assert "Submit no more than 2" in warning_text
+    assert all(result.isError is False for result in completed_results)
+    assert retry_result.isError is False
 
 
 def test_webpage_scrape_session_limit_errors_after_success(
