@@ -1,21 +1,22 @@
-"""FastMCP server exposing Serper search and scrape tools."""
+"""MCP server exposing Serper search and scrape tools."""
 
 from __future__ import annotations
 
 import logging
 import os
 from asyncio import Lock
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal, TypeVar
 from weakref import WeakKeyDictionary
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from .core import SerperClient, SerperConfigurationError
+from .core import SerperClient, SerperClientError, SerperConfigurationError
 from .enums import SerperTools
 from .metrics import (
     MetricsConfigurationError,
@@ -47,10 +48,10 @@ SESSION_LIMIT_ENV_PREFIX = "SERPER_"
 SESSION_LIMIT_ENV_SUFFIX = "_SESSION_LIMIT"
 
 READ_ONLY_OPEN_WEB_ANNOTATIONS = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=False,
-    openWorldHint=True,
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=True,
 )
 
 QueryParam = Annotated[
@@ -151,8 +152,8 @@ logger = logging.getLogger(__name__)
 RequestModelT = TypeVar("RequestModelT", bound=BaseModel)
 
 
-class SessionLimitFallbackKey:
-    """Weak-referenceable fallback key for direct in-process tool calls."""
+class SessionUsageKey:
+    """Weak-referenceable usage key for one stdio connection or direct calls."""
 
 
 class UsageLimitReachedError(Exception):
@@ -198,7 +199,7 @@ class ToolUsageState:
 
 
 class SerperMcpApplication:
-    """Factory and registry for the Serper FastMCP server.
+    """Factory and registry for the Serper MCP server.
 
     :param client: Serper API client used by tool handlers.
     :type client: SerperClient | None
@@ -212,10 +213,8 @@ class SerperMcpApplication:
             object,
             dict[SerperTools, ToolUsageState],
         ] = WeakKeyDictionary()
-        self.direct_call_session_key: SessionLimitFallbackKey = (
-            SessionLimitFallbackKey()
-        )
-        self.mcp: FastMCP = FastMCP(
+        self.direct_call_session_key: SessionUsageKey = SessionUsageKey()
+        self.mcp: MCPServer[SessionUsageKey] = MCPServer(
             "Serper",
             instructions=SERVER_INSTRUCTIONS,
             lifespan=self.lifespan,
@@ -223,18 +222,20 @@ class SerperMcpApplication:
         self.register_tools()
 
     @asynccontextmanager
-    async def lifespan(self, _server: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(
+        self, _server: MCPServer[SessionUsageKey]
+    ) -> AsyncGenerator[SessionUsageKey, None]:
         """Manage reusable Serper client resources.
 
-        :param _server: FastMCP server instance.
-        :type _server: FastMCP
+        :param _server: MCP server instance.
+        :type _server: MCPServer[SessionUsageKey]
         :return: Async lifespan iterator.
-        :rtype: AsyncIterator[None]
+        :rtype: AsyncGenerator[SessionUsageKey, None]
         """
 
         try:
             await self.start_metrics()
-            yield
+            yield SessionUsageKey()
         finally:
             await self.client.close()
             await self.close_metrics()
@@ -345,29 +346,32 @@ class SerperMcpApplication:
             f"{SESSION_LIMIT_ENV_SUFFIX}"
         )
 
-    def get_session_key(self, ctx: Context[Any, Any, Any]) -> object:
-        """Return the key used for per-session tool usage state.
+    def get_session_key(self, ctx: Context[SessionUsageKey, Any]) -> object:
+        """Return a lifespan key stable across requests on a stdio connection.
 
-        :param ctx: FastMCP request context.
-        :type ctx: Context[Any, Any, Any]
-        :return: MCP session object or direct-call fallback key.
+        MCP 2 creates a new session proxy per request. The stdio lifespan
+        owns one connection, so its key retains quota across those proxies.
+
+        :param ctx: MCPServer request context.
+        :type ctx: Context[SessionUsageKey, Any]
+        :return: Stdio lifespan key or direct-call fallback key.
         :rtype: object
         """
 
         try:
-            return ctx.session
+            return ctx.request_context.lifespan_context
         except ValueError:
             return self.direct_call_session_key
 
     def get_usage_state(
         self,
-        ctx: Context[Any, Any, Any],
+        ctx: Context[SessionUsageKey, Any],
         tool_name: SerperTools,
     ) -> ToolUsageState:
         """Return mutable usage state for a tool in the current session.
 
-        :param ctx: FastMCP request context.
-        :type ctx: Context[Any, Any, Any]
+        :param ctx: MCPServer request context.
+        :type ctx: Context[SessionUsageKey, Any]
         :param tool_name: Tool whose usage is being tracked.
         :type tool_name: SerperTools
         :return: Tool usage state.
@@ -382,40 +386,43 @@ class SerperMcpApplication:
 
     async def call_with_session_limit(
         self,
-        ctx: Context[Any, Any, Any],
+        ctx: Context[SessionUsageKey, Any],
         tool_name: SerperTools,
         call: Callable[[], Awaitable[dict[str, Any]]],
     ) -> dict[str, Any]:
         """Call a tool implementation while enforcing successful-call limits.
 
-        :param ctx: FastMCP request context.
-        :type ctx: Context[Any, Any, Any]
+        :param ctx: MCPServer request context.
+        :type ctx: Context[SessionUsageKey, Any]
         :param tool_name: Tool being called.
         :type tool_name: SerperTools
         :param call: Awaitable Serper client call.
         :type call: Callable[[], Awaitable[dict[str, Any]]]
         :return: Serper client response.
         :rtype: dict[str, Any]
-        :raises UsageLimitReachedError: If the session limit is exhausted.
+        :raises ToolError: If quota is exhausted or the Serper call fails.
         """
 
-        limit = self.session_limits.get(tool_name)
-        if limit is None:
-            return await call()
-
-        usage_state = self.get_usage_state(ctx, tool_name)
-        if not await usage_state.reserve_call(limit):
-            raise UsageLimitReachedError(
-                self.build_usage_limit_message(tool_name, limit)
-            )
-
-        succeeded = False
         try:
-            response = await call()
-            succeeded = True
-            return response
-        finally:
-            await usage_state.finish_call(succeeded)
+            limit = self.session_limits.get(tool_name)
+            if limit is None:
+                return await call()
+
+            usage_state = self.get_usage_state(ctx, tool_name)
+            if not await usage_state.reserve_call(limit):
+                raise UsageLimitReachedError(
+                    self.build_usage_limit_message(tool_name, limit)
+                )
+
+            succeeded = False
+            try:
+                response = await call()
+                succeeded = True
+                return response
+            finally:
+                await usage_state.finish_call(succeeded)
+        except (SerperClientError, UsageLimitReachedError) as exc:
+            raise ToolError(str(exc)) from exc
 
     @staticmethod
     def build_usage_limit_message(tool_name: SerperTools, limit: int) -> str:
@@ -438,14 +445,14 @@ class SerperMcpApplication:
 
     async def execute_google_tool(
         self,
-        ctx: Context[Any, Any, Any],
+        ctx: Context[SessionUsageKey, Any],
         tool: SerperTools,
         request: BaseModel,
     ) -> dict[str, Any]:
         """Execute a Google-backed Serper tool.
 
-        :param ctx: FastMCP request context.
-        :type ctx: Context[Any, Any, Any]
+        :param ctx: MCPServer request context.
+        :type ctx: Context[SessionUsageKey, Any]
         :param tool: Serper tool enum value.
         :type tool: SerperTools
         :param request: Validated search request.
@@ -480,7 +487,10 @@ class SerperMcpApplication:
             name: self.resolve_forced_parameter(name, value)
             for name, value in values.items()
         }
-        return model_type(**forced_values)
+        try:
+            return model_type(**forced_values)
+        except ValidationError as exc:
+            raise ToolError(str(exc)) from exc
 
     def resolve_forced_parameter(self, parameter_name: str, value: Any) -> Any:
         """Resolve a parameter value from a forced env var or the tool argument.
@@ -553,7 +563,7 @@ class SerperMcpApplication:
 
         async def google_search(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -581,7 +591,7 @@ class SerperMcpApplication:
 
         async def google_search_images(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -609,7 +619,7 @@ class SerperMcpApplication:
 
         async def google_search_videos(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -637,7 +647,7 @@ class SerperMcpApplication:
 
         async def google_search_news(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -705,7 +715,7 @@ class SerperMcpApplication:
 
         async def google_search_places(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -731,7 +741,7 @@ class SerperMcpApplication:
 
         async def google_search_scholar(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -757,7 +767,7 @@ class SerperMcpApplication:
 
         async def google_search_autocomplete(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -815,7 +825,7 @@ class SerperMcpApplication:
 
         async def google_search_maps(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             ll: MapsLocationParam = None,
             placeId: PlaceIdParam = None,
             cid: CustomerIdParam = None,
@@ -859,7 +869,7 @@ class SerperMcpApplication:
 
         async def google_search_reviews(
             fid: FeatureIdParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             cid: CustomerIdParam = None,
             placeId: PlaceIdParam = None,
             sortBy: ReviewSortParam = "mostRelevant",
@@ -905,7 +915,7 @@ class SerperMcpApplication:
 
         async def google_search_shopping(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             location: LocationParam = None,
             hl: LanguageParam = None,
@@ -949,7 +959,7 @@ class SerperMcpApplication:
 
         async def google_search_lens(
             url: ImageUrlParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             gl: CountryParam = None,
             hl: LanguageParam = None,
         ) -> dict[str, Any]:
@@ -980,7 +990,7 @@ class SerperMcpApplication:
 
         async def google_search_patents(
             q: QueryParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             num: ResultCountParam = 10,
             page: PageParam = 1,
         ) -> dict[str, Any]:
@@ -1011,7 +1021,7 @@ class SerperMcpApplication:
 
         async def webpage_scrape(
             url: ScrapeUrlParam,
-            ctx: Context[Any, Any, Any],
+            ctx: Context[SessionUsageKey, Any],
             includeMarkdown: IncludeMarkdownParam = False,
         ) -> dict[str, Any]:
             """Scrape a webpage URL."""
@@ -1037,13 +1047,15 @@ class SerperMcpApplication:
         )
 
 
-def create_mcp_server(client: SerperClient | None = None) -> FastMCP:
-    """Create the Serper FastMCP server.
+def create_mcp_server(
+    client: SerperClient | None = None,
+) -> MCPServer[SessionUsageKey]:
+    """Create the Serper MCP server.
 
     :param client: Optional Serper client for tests or custom integrations.
     :type client: SerperClient | None
-    :return: Configured FastMCP server.
-    :rtype: FastMCP
+    :return: Configured MCP server.
+    :rtype: MCPServer
     """
 
     load_dotenv()

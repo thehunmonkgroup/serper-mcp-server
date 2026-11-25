@@ -1,11 +1,17 @@
-"""Tests for the Serper FastMCP server."""
+"""Tests for the Serper MCP server."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
-from mcp import types
+from mcp import Client, types
 import pytest
 from typing_extensions import override
 
@@ -20,10 +26,13 @@ from serper_mcp_server.metrics import (
     METRICS_ENABLED_ENV_VAR,
     METRICS_HOST_ENV_VAR,
     METRICS_PORT_ENV_VAR,
+    MetricsService,
     NullMetricsRecorder,
 )
 from serper_mcp_server.schemas import WebpageRequest
 from serper_mcp_server.server import SerperMcpApplication, create_mcp_server
+
+pytestmark = pytest.mark.anyio
 
 
 class FakeSerperClient(SerperClient):
@@ -144,6 +153,7 @@ class BlockingSerperClient(FakeSerperClient):
         self.maximum_active_calls: int = 0
         self.expected_calls_started: asyncio.Event = asyncio.Event()
         self.release_calls: asyncio.Event = asyncio.Event()
+        self.call_finished: asyncio.Event = asyncio.Event()
 
     async def wait_for_release(self) -> None:
         """Run one tracked call until the test releases it.
@@ -164,6 +174,7 @@ class BlockingSerperClient(FakeSerperClient):
                 await self.release_calls.wait()
             finally:
                 self.active_calls -= 1
+                self.call_finished.set()
 
     @override
     async def google(
@@ -246,66 +257,47 @@ def clear_session_limit_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, raising=False)
 
 
-def run_async(awaitable: Any) -> Any:
-    """Run an awaitable for tests.
+class ServerFactory:
+    """Keep real in-process MCP connections open for the duration of a test."""
 
-    :param awaitable: Awaitable object.
-    :type awaitable: Any
-    :return: Awaitable result.
-    :rtype: Any
-    """
+    def __init__(self, stack: AsyncExitStack, mode: str) -> None:
+        self.stack: AsyncExitStack = stack
+        self.mode: str = mode
 
-    return asyncio.run(awaitable)
+    async def connect(self, client: SerperClient) -> Client:
+        """Start a server and connect through the SDK's public client API."""
+
+        return await self.stack.enter_async_context(
+            Client(create_mcp_server(client), mode=self.mode)
+        )
 
 
-def call_tool_result(
-    mcp_server: Any,
-    tool_name: SerperTools,
-    arguments: dict[str, Any],
-) -> types.CallToolResult:
-    """Call a tool through the low-level MCP request handler.
+@pytest.fixture
+def anyio_backend() -> str:
+    """Exercise the asyncio backend used by the server."""
 
-    :param mcp_server: FastMCP server instance.
-    :type mcp_server: Any
-    :param tool_name: Tool to call.
-    :type tool_name: SerperTools
-    :param arguments: Tool arguments.
-    :type arguments: dict[str, Any]
-    :return: MCP call tool result.
-    :rtype: types.CallToolResult
-    """
+    return "asyncio"
 
-    return run_async(call_tool_result_async(mcp_server, tool_name, arguments))
+
+@pytest.fixture(params=["legacy", "auto"])
+async def server_factory(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> AsyncIterator[ServerFactory]:
+    """Close all client transports and lifespans after each test."""
+
+    monkeypatch.setenv("MCP_METRICS_ENABLED", "false")
+    async with AsyncExitStack() as stack:
+        yield ServerFactory(stack, request.param)
 
 
 async def call_tool_result_async(
-    mcp_server: Any,
+    mcp_server: Client,
     tool_name: SerperTools,
     arguments: dict[str, Any],
 ) -> types.CallToolResult:
-    """Call a tool asynchronously through the low-level request handler.
+    """Call through the public client API, including wire error conversion."""
 
-    :param mcp_server: FastMCP server instance.
-    :type mcp_server: Any
-    :param tool_name: Tool to call.
-    :type tool_name: SerperTools
-    :param arguments: Tool arguments.
-    :type arguments: dict[str, Any]
-    :return: MCP call tool result.
-    :rtype: types.CallToolResult
-    """
-
-    low_level_server = getattr(mcp_server, "_mcp_server")
-    handler = low_level_server.request_handlers[types.CallToolRequest]
-    result = await handler(
-        types.CallToolRequest(
-            params=types.CallToolRequestParams(
-                name=tool_name.value,
-                arguments=arguments,
-            )
-        )
-    )
-    return result.root
+    return await mcp_server.call_tool(tool_name.value, arguments)
 
 
 def call_tool_text(call_result: types.CallToolResult) -> str:
@@ -322,11 +314,13 @@ def call_tool_text(call_result: types.CallToolResult) -> str:
     return content.text
 
 
-def test_tool_list_contains_expected_metadata() -> None:
+async def test_tool_list_contains_expected_metadata(
+    server_factory: ServerFactory,
+) -> None:
     """All public tools expose useful metadata and annotations."""
 
-    mcp_server = create_mcp_server(FakeSerperClient())
-    tools = run_async(mcp_server.list_tools())
+    mcp_server = await server_factory.connect(FakeSerperClient())
+    tools = (await mcp_server.list_tools()).tools
     tools_by_name = {tool.name: tool for tool in tools}
     expected_tool_descriptions = {
         SerperTools.GOOGLE_SEARCH.value: "Search Google web results.",
@@ -355,13 +349,13 @@ def test_tool_list_contains_expected_metadata() -> None:
 
     search_tool = tools_by_name[SerperTools.GOOGLE_SEARCH.value]
     assert search_tool.title == "Google Search"
-    assert search_tool.outputSchema is not None
+    assert search_tool.output_schema is not None
     assert search_tool.annotations is not None
-    assert search_tool.annotations.readOnlyHint is True
-    assert search_tool.annotations.destructiveHint is False
-    assert search_tool.annotations.idempotentHint is False
-    assert search_tool.annotations.openWorldHint is True
-    search_properties = search_tool.inputSchema["properties"]
+    assert search_tool.annotations.read_only_hint is True
+    assert search_tool.annotations.destructive_hint is False
+    assert search_tool.annotations.idempotent_hint is False
+    assert search_tool.annotations.open_world_hint is True
+    search_properties = search_tool.input_schema["properties"]
     assert search_properties["page"]["type"] == "integer"
     assert search_properties["page"]["minimum"] == 1
     assert search_properties["page"]["default"] == 1
@@ -383,7 +377,7 @@ def test_tool_list_contains_expected_metadata() -> None:
     } == expected_search_descriptions
 
     places_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_PLACES.value]
-    places_properties = places_tool.inputSchema["properties"]
+    places_properties = places_tool.input_schema["properties"]
     assert places_properties["autocorrect"]["type"] == "boolean"
     assert places_properties["autocorrect"]["default"] is True
     assert places_properties["autocorrect"]["description"] == (
@@ -391,7 +385,7 @@ def test_tool_list_contains_expected_metadata() -> None:
     )
 
     maps_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_MAPS.value]
-    maps_properties = maps_tool.inputSchema["properties"]
+    maps_properties = maps_tool.input_schema["properties"]
     assert maps_properties["ll"]["description"] == (
         "Google Maps latitude, longitude, and zoom string, such as "
         "@40.7504178,-73.9824837,14z."
@@ -404,7 +398,7 @@ def test_tool_list_contains_expected_metadata() -> None:
     )
 
     reviews_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_REVIEWS.value]
-    reviews_properties = reviews_tool.inputSchema["properties"]
+    reviews_properties = reviews_tool.input_schema["properties"]
     assert reviews_properties["fid"]["description"] == (
         "Google reviews feature ID for the place."
     )
@@ -426,39 +420,45 @@ def test_tool_list_contains_expected_metadata() -> None:
     )
 
     lens_tool = tools_by_name[SerperTools.GOOGLE_SEARCH_LENS.value]
-    lens_properties = lens_tool.inputSchema["properties"]
+    lens_properties = lens_tool.input_schema["properties"]
     assert lens_properties["url"]["description"] == (
         "Absolute image URL to search with Google Lens."
     )
 
     scrape_tool = tools_by_name[SerperTools.WEBPAGE_SCRAPE.value]
-    include_markdown_schema = scrape_tool.inputSchema["properties"]["includeMarkdown"]
+    include_markdown_schema = scrape_tool.input_schema["properties"]["includeMarkdown"]
     assert include_markdown_schema["type"] == "boolean"
     assert include_markdown_schema["default"] is False
     assert include_markdown_schema["description"] == (
         "Include Markdown in the scrape response."
     )
-    assert scrape_tool.inputSchema["properties"]["url"]["description"] == (
+    assert scrape_tool.input_schema["properties"]["url"]["description"] == (
         "Absolute URL to scrape."
     )
 
 
-def test_google_search_returns_structured_content() -> None:
+async def test_google_search_returns_structured_content(
+    server_factory: ServerFactory,
+) -> None:
     """Successful search calls return structured content."""
 
     client = FakeSerperClient()
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
-    content, structured_content = run_async(
-        mcp_server.call_tool(
-            SerperTools.GOOGLE_SEARCH.value,
-            {"q": "openai", "num": 5, "page": 1},
-        )
+    result = await mcp_server.call_tool(
+        SerperTools.GOOGLE_SEARCH.value,
+        {"q": "openai", "num": 5, "page": 1},
     )
 
-    assert structured_content["credits"] == 1
-    assert structured_content["organic"][0]["title"] == "Example"
-    assert content[0].type == "text"
+    assert result.structured_content is not None
+    assert result.structured_content["credits"] == 1
+    assert result.structured_content["organic"][0]["title"] == "Example"
+    assert json.loads(call_tool_text(result)) == result.structured_content
+    assert (
+        result.model_dump(by_alias=True)["structuredContent"]
+        == result.structured_content
+    )
+    assert result.model_dump(by_alias=True)["isError"] is False
     assert client.last_tool == SerperTools.GOOGLE_SEARCH
     assert client.last_payload is not None
     assert client.last_payload["num"] == 5
@@ -479,7 +479,8 @@ def test_forced_env_var_name_converts_parameter_names() -> None:
     )
 
 
-def test_google_search_uses_forced_environment_values(
+async def test_google_search_uses_forced_environment_values(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Search calls prefer forced environment values over caller arguments."""
@@ -488,13 +489,11 @@ def test_google_search_uses_forced_environment_values(
     monkeypatch.setenv("SERPER_FORCE_HL", "en")
     monkeypatch.setenv("SERPER_FORCE_NUM", "7")
     client = FakeSerperClient()
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
-    run_async(
-        mcp_server.call_tool(
-            SerperTools.GOOGLE_SEARCH.value,
-            {"q": "openai", "gl": "ca", "hl": "fr", "num": 5},
-        )
+    await mcp_server.call_tool(
+        SerperTools.GOOGLE_SEARCH.value,
+        {"q": "openai", "gl": "ca", "hl": "fr", "num": 5},
     )
 
     assert client.last_payload is not None
@@ -503,47 +502,53 @@ def test_google_search_uses_forced_environment_values(
     assert client.last_payload["num"] == 7
 
 
-def test_webpage_scrape_returns_structured_content() -> None:
+async def test_webpage_scrape_returns_structured_content(
+    server_factory: ServerFactory,
+) -> None:
     """Successful scrape calls return structured content."""
 
     client = FakeSerperClient()
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
-    content, structured_content = run_async(
-        mcp_server.call_tool(
-            SerperTools.WEBPAGE_SCRAPE.value,
-            {"url": "https://example.com", "includeMarkdown": True},
-        )
+    result = await mcp_server.call_tool(
+        SerperTools.WEBPAGE_SCRAPE.value,
+        {"url": "https://example.com", "includeMarkdown": True},
     )
 
-    assert structured_content["credits"] == 2
-    assert structured_content["metadata"]["title"] == "Example Domain"
-    assert content[0].type == "text"
+    assert result.structured_content is not None
+    assert result.structured_content["credits"] == 2
+    assert result.structured_content["metadata"]["title"] == "Example Domain"
+    assert json.loads(call_tool_text(result)) == result.structured_content
+    assert (
+        result.model_dump(by_alias=True)["structuredContent"]
+        == result.structured_content
+    )
+    assert result.model_dump(by_alias=True)["isError"] is False
     assert client.last_payload is not None
     assert client.last_payload["includeMarkdown"] is True
 
 
-def test_webpage_scrape_uses_forced_environment_values(
+async def test_webpage_scrape_uses_forced_environment_values(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Scrape calls prefer forced environment values over caller arguments."""
 
     monkeypatch.setenv("SERPER_FORCE_INCLUDE_MARKDOWN", "true")
     client = FakeSerperClient()
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
-    run_async(
-        mcp_server.call_tool(
-            SerperTools.WEBPAGE_SCRAPE.value,
-            {"url": "https://example.com", "includeMarkdown": False},
-        )
+    await mcp_server.call_tool(
+        SerperTools.WEBPAGE_SCRAPE.value,
+        {"url": "https://example.com", "includeMarkdown": False},
     )
 
     assert client.last_payload is not None
     assert client.last_payload["includeMarkdown"] is True
 
 
-def test_google_search_session_limit_errors_after_success(
+async def test_google_search_session_limit_errors_after_success(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Search limits apply after the configured number of successful calls."""
@@ -552,27 +557,28 @@ def test_google_search_session_limit_errors_after_success(
         SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
         "1",
     )
-    mcp_server = create_mcp_server(FakeSerperClient())
+    mcp_server = await server_factory.connect(FakeSerperClient())
 
-    first_result = call_tool_result(
+    first_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    second_result = call_tool_result(
+    second_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
 
-    assert first_result.isError is False
-    assert second_result.isError is True
+    assert first_result.is_error is False
+    assert second_result.is_error is True
     second_result_text = call_tool_text(second_result)
     assert "usage limit reached" in second_result_text
     assert "Do not call google_search again" in second_result_text
 
 
-def test_session_limit_allows_calls_to_run_concurrently(
+async def test_session_limit_allows_calls_to_run_concurrently(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Session quota reservations do not serialize outbound tool calls."""
@@ -582,7 +588,7 @@ def test_session_limit_allows_calls_to_run_concurrently(
         "2",
     )
     client = BlockingSerperClient(expected_active_calls=2)
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
     async def exercise_session_limit() -> list[types.CallToolResult]:
         first_call = asyncio.create_task(
@@ -612,16 +618,17 @@ def test_session_limit_allows_calls_to_run_concurrently(
         completed_results = await asyncio.gather(first_call, second_call)
         return [*completed_results, limited_result]
 
-    first_result, second_result, limited_result = run_async(exercise_session_limit())
+    first_result, second_result, limited_result = await exercise_session_limit()
 
     assert client.maximum_active_calls == 2
-    assert first_result.isError is False
-    assert second_result.isError is False
-    assert limited_result.isError is True
+    assert first_result.is_error is False
+    assert second_result.is_error is False
+    assert limited_result.is_error is True
     assert "usage limit reached" in call_tool_text(limited_result)
 
 
-def test_cancelled_call_releases_session_limit_reservation(
+async def test_cancelled_call_releases_session_limit_reservation(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancellation returns reserved session quota for a later call."""
@@ -631,7 +638,7 @@ def test_cancelled_call_releases_session_limit_reservation(
         "1",
     )
     client = BlockingSerperClient(expected_active_calls=1)
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
     async def cancel_and_retry() -> types.CallToolResult:
         cancelled_call = asyncio.create_task(
@@ -645,6 +652,7 @@ def test_cancelled_call_releases_session_limit_reservation(
         cancelled_call.cancel()
         with pytest.raises(asyncio.CancelledError):
             await cancelled_call
+        await asyncio.wait_for(client.call_finished.wait(), timeout=1)
 
         client.release_calls.set()
         return await call_tool_result_async(
@@ -653,19 +661,20 @@ def test_cancelled_call_releases_session_limit_reservation(
             {"q": "retry"},
         )
 
-    retry_result = run_async(cancel_and_retry())
+    retry_result = await cancel_and_retry()
 
-    assert retry_result.isError is False
+    assert retry_result.is_error is False
 
 
-def test_global_concurrency_limit_replies_with_warning_without_queueing(
+async def test_global_concurrency_limit_replies_with_warning_without_queueing(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mixed tools share one fail-fast concurrent request limit."""
 
     monkeypatch.setenv(SERPER_MAX_CONCURRENT_REQUESTS_ENV_VAR, "2")
     client = BlockingSerperClient(expected_active_calls=2)
-    mcp_server = create_mcp_server(client)
+    mcp_server = await server_factory.connect(client)
 
     async def exercise_concurrency_limit() -> tuple[
         types.CallToolResult,
@@ -704,21 +713,22 @@ def test_global_concurrency_limit_replies_with_warning_without_queueing(
         )
         return rejected_result, completed_results, retry_result
 
-    rejected_result, completed_results, retry_result = run_async(
-        exercise_concurrency_limit()
+    rejected_result, completed_results, retry_result = (
+        await exercise_concurrency_limit()
     )
 
     assert client.maximum_active_calls == 2
-    assert rejected_result.isError is True
+    assert rejected_result.is_error is True
     warning_text = call_tool_text(rejected_result)
     assert "WARNING: The maximum of 2 simultaneous" in warning_text
     assert "not submitted or queued" in warning_text
     assert "Submit no more than 2" in warning_text
-    assert all(result.isError is False for result in completed_results)
-    assert retry_result.isError is False
+    assert all(result.is_error is False for result in completed_results)
+    assert retry_result.is_error is False
 
 
-def test_webpage_scrape_session_limit_errors_after_success(
+async def test_webpage_scrape_session_limit_errors_after_success(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Scrape limits apply after the configured number of successful calls."""
@@ -727,27 +737,28 @@ def test_webpage_scrape_session_limit_errors_after_success(
         SerperMcpApplication.session_limit_env_var_name(SerperTools.WEBPAGE_SCRAPE),
         "1",
     )
-    mcp_server = create_mcp_server(FakeSerperClient())
+    mcp_server = await server_factory.connect(FakeSerperClient())
 
-    first_result = call_tool_result(
+    first_result = await call_tool_result_async(
         mcp_server,
         SerperTools.WEBPAGE_SCRAPE,
         {"url": "https://example.com"},
     )
-    second_result = call_tool_result(
+    second_result = await call_tool_result_async(
         mcp_server,
         SerperTools.WEBPAGE_SCRAPE,
         {"url": "https://example.com"},
     )
 
-    assert first_result.isError is False
-    assert second_result.isError is True
+    assert first_result.is_error is False
+    assert second_result.is_error is True
     second_result_text = call_tool_text(second_result)
     assert "usage limit reached" in second_result_text
     assert "Do not call webpage_scrape again" in second_result_text
 
 
-def test_session_limits_are_independent_by_tool(
+async def test_session_limits_are_independent_by_tool(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exhausting one tool limit does not block another tool."""
@@ -762,30 +773,31 @@ def test_session_limits_are_independent_by_tool(
         ),
         "1",
     )
-    mcp_server = create_mcp_server(FakeSerperClient())
+    mcp_server = await server_factory.connect(FakeSerperClient())
 
-    search_result = call_tool_result(
+    search_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    limited_search_result = call_tool_result(
+    limited_search_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    image_result = call_tool_result(
+    image_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH_IMAGES,
         {"q": "openai"},
     )
 
-    assert search_result.isError is False
-    assert limited_search_result.isError is True
-    assert image_result.isError is False
+    assert search_result.is_error is False
+    assert limited_search_result.is_error is True
+    assert image_result.is_error is False
 
 
-def test_validation_failures_do_not_consume_session_limit(
+async def test_validation_failures_do_not_consume_session_limit(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Calls rejected by MCP validation do not count against the limit."""
@@ -794,31 +806,32 @@ def test_validation_failures_do_not_consume_session_limit(
         SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
         "1",
     )
-    mcp_server = create_mcp_server(FakeSerperClient())
+    mcp_server = await server_factory.connect(FakeSerperClient())
 
-    invalid_result = call_tool_result(
+    invalid_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai", "num": 0},
     )
-    successful_result = call_tool_result(
+    successful_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    limited_result = call_tool_result(
+    limited_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
 
-    assert invalid_result.isError is True
-    assert successful_result.isError is False
-    assert limited_result.isError is True
+    assert invalid_result.is_error is True
+    assert successful_result.is_error is False
+    assert limited_result.is_error is True
     assert "usage limit reached" in call_tool_text(limited_result)
 
 
-def test_serper_failures_do_not_consume_session_limit(
+async def test_serper_failures_do_not_consume_session_limit(
+    server_factory: ServerFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Serper client failures do not count against the limit."""
@@ -827,28 +840,28 @@ def test_serper_failures_do_not_consume_session_limit(
         SerperMcpApplication.session_limit_env_var_name(SerperTools.GOOGLE_SEARCH),
         "1",
     )
-    mcp_server = create_mcp_server(IntermittentFailingSerperClient())
+    mcp_server = await server_factory.connect(IntermittentFailingSerperClient())
 
-    failed_result = call_tool_result(
+    failed_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    successful_result = call_tool_result(
+    successful_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
-    limited_result = call_tool_result(
+    limited_result = await call_tool_result_async(
         mcp_server,
         SerperTools.GOOGLE_SEARCH,
         {"q": "openai"},
     )
 
-    assert failed_result.isError is True
+    assert failed_result.is_error is True
     assert "Serper API returned HTTP 500" in call_tool_text(failed_result)
-    assert successful_result.isError is False
-    assert limited_result.isError is True
+    assert successful_result.is_error is False
+    assert limited_result.is_error is True
     assert "usage limit reached" in call_tool_text(limited_result)
 
 
@@ -871,7 +884,7 @@ def test_invalid_session_limit_fails_startup(
         create_mcp_server(FakeSerperClient())
 
 
-def test_metrics_disabled_uses_null_recorder(
+async def test_metrics_disabled_uses_null_recorder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Disabled metrics leave the client with a null metrics recorder."""
@@ -879,13 +892,13 @@ def test_metrics_disabled_uses_null_recorder(
     monkeypatch.setenv(METRICS_ENABLED_ENV_VAR, "false")
     application = SerperMcpApplication(FakeSerperClient())
 
-    run_async(application.start_metrics())
+    await application.start_metrics()
 
     assert isinstance(application.client.metrics, NullMetricsRecorder)
     assert application.metrics_service is None
 
 
-def test_metrics_service_starts_and_closes(
+async def test_metrics_service_starts_and_closes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Application startup owns the metrics service lifecycle."""
@@ -896,7 +909,7 @@ def test_metrics_service_starts_and_closes(
     monkeypatch.setattr("serper_mcp_server.server.MetricsService", FakeMetricsService)
     application = SerperMcpApplication(FakeSerperClient())
 
-    run_async(application.start_metrics())
+    await application.start_metrics()
 
     service = application.metrics_service
     assert isinstance(service, FakeMetricsService)
@@ -904,54 +917,98 @@ def test_metrics_service_starts_and_closes(
     assert service.started_port == 3006
     assert application.client.metrics is service
 
-    run_async(application.close_metrics())
+    await application.close_metrics()
 
     assert service.closed is True
     assert application.metrics_service is None
     assert isinstance(application.client.metrics, NullMetricsRecorder)
 
 
-def test_expected_tool_failure_sets_is_error() -> None:
+async def test_expected_tool_failure_sets_is_error(
+    server_factory: ServerFactory,
+) -> None:
     """Expected execution failures are exposed as MCP tool errors."""
 
-    mcp_server = create_mcp_server(FailingSerperClient())
-    low_level_server = getattr(mcp_server, "_mcp_server")
-    handler = low_level_server.request_handlers[types.CallToolRequest]
-
-    result = run_async(
-        handler(
-            types.CallToolRequest(
-                params=types.CallToolRequestParams(
-                    name=SerperTools.GOOGLE_SEARCH.value,
-                    arguments={"q": "openai"},
-                )
-            )
-        )
+    mcp_server = await server_factory.connect(FailingSerperClient())
+    call_result = await mcp_server.call_tool(
+        SerperTools.GOOGLE_SEARCH.value, {"q": "openai"}
     )
 
-    call_result = result.root
-    assert call_result.isError is True
-    assert "SERPER_API_KEY is empty" in call_result.content[0].text
+    assert call_result.is_error is True
+    assert call_tool_text(call_result) == (
+        "Error executing tool google_search: SERPER_API_KEY is empty"
+    )
 
 
-def test_invalid_arguments_fail_validation() -> None:
+async def test_invalid_arguments_fail_validation(
+    server_factory: ServerFactory,
+) -> None:
     """Invalid tool arguments are rejected before handler execution."""
 
-    mcp_server = create_mcp_server(FakeSerperClient())
-    low_level_server = getattr(mcp_server, "_mcp_server")
-    handler = low_level_server.request_handlers[types.CallToolRequest]
-
-    result = run_async(
-        handler(
-            types.CallToolRequest(
-                params=types.CallToolRequestParams(
-                    name=SerperTools.GOOGLE_SEARCH.value,
-                    arguments={"q": "openai", "num": 0},
-                )
-            )
-        )
+    mcp_server = await server_factory.connect(FakeSerperClient())
+    call_result = await mcp_server.call_tool(
+        SerperTools.GOOGLE_SEARCH.value, {"q": "openai", "num": 0}
     )
+    assert call_result.is_error is True
+    assert "validation error" in call_tool_text(call_result)
 
-    call_result = result.root
-    assert call_result.isError is True
-    assert "validation error" in call_result.content[0].text
+
+async def test_new_connections_have_independent_session_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new connection to the same server gets fresh quota."""
+
+    monkeypatch.setenv("MCP_METRICS_ENABLED", "false")
+    monkeypatch.setenv("SERPER_GOOGLE_SEARCH_SESSION_LIMIT", "1")
+    application = SerperMcpApplication(FakeSerperClient())
+    for mode in ("legacy", "auto", "legacy"):
+        async with Client(application.mcp, mode=mode) as client:
+            first = await client.call_tool("google_search", {"q": "first"})
+            second = await client.call_tool("google_search", {"q": "second"})
+            assert first.is_error is False
+            assert second.is_error is True
+            assert "usage limit reached" in call_tool_text(second)
+
+
+async def test_forced_value_validation_is_a_tool_error(
+    server_factory: ServerFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bad forced configuration remains a readable error and consumes no quota."""
+
+    monkeypatch.setenv("SERPER_GOOGLE_SEARCH_SESSION_LIMIT", "1")
+    monkeypatch.setenv("SERPER_FORCE_NUM", "invalid")
+    client = await server_factory.connect(FakeSerperClient())
+    failed = await client.call_tool("google_search", {"q": "test"})
+    assert failed.is_error is True
+    assert "validation error" in call_tool_text(failed)
+    monkeypatch.delenv("SERPER_FORCE_NUM")
+    successful = await client.call_tool("google_search", {"q": "test"})
+    assert successful.is_error is False
+
+
+async def test_metrics_and_client_follow_server_lifespan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The MCP 2 lifespan owns metrics and closes both metrics and HTTP client."""
+
+    monkeypatch.setenv("MCP_METRICS_ENABLED", "true")
+    monkeypatch.setenv("MCP_METRICS_DB_PATH", str(tmp_path / "metrics.sqlite3"))
+    monkeypatch.setenv("MCP_METRICS_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_METRICS_PORT", "3006")
+    start_http = AsyncMock()
+    monkeypatch.setattr(MetricsService, "start_http_server", start_http)
+    backend = FakeSerperClient()
+    close_client = AsyncMock(wraps=backend.close)
+    monkeypatch.setattr(backend, "close", close_client)
+    application = SerperMcpApplication(backend)
+    async with Client(application.mcp, mode="legacy"):
+        metrics = application.metrics_service
+        assert metrics is not None
+        assert backend.metrics is metrics
+        start_http.assert_awaited_once_with("127.0.0.1", 3006)
+        assert metrics.db.execute("SELECT 1").fetchone()[0] == 1
+    close_client.assert_awaited_once()
+    assert application.metrics_service is None
+    assert isinstance(backend.metrics, NullMetricsRecorder)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        metrics.db.execute("SELECT 1")

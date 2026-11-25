@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import ssl
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from time import perf_counter
 from typing import Any
@@ -65,14 +65,14 @@ class ConcurrentRequestLimiter:
         self.active_requests: int = 0
 
     @contextmanager
-    def claim_request_slot(self) -> Iterator[None]:
+    def claim_request_slot(self) -> Generator[None, None, None]:
         """Claim an outbound request slot without waiting.
 
         State transitions are synchronous because an aiohttp client and its
         event loop execute task code cooperatively between await points.
 
         :return: Context manager that releases the claimed request slot.
-        :rtype: Iterator[None]
+        :rtype: Generator[None, None, None]
         :raises SerperConcurrencyLimitError: If every slot is active.
         """
 
